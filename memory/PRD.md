@@ -1,6 +1,18 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-006 — FORMALLY CLOSED (2026-08-18)
+
+**Status**: CLOSED · signed off by user after F-008 production verification.
+
+**Deployed** (13): F-001, F-002, B1, B2, F-003, F-004-A, F-004-B, F-005, F-006, F-007, F-008, F-010, F-012, F-013.
+**Deferred / WON'T FIX** (2): F-009 (canary redundant post-P2A), F-011 (user-visible symptom already resolved by prior commits).
+
+**Test evidence at closure**: NAV-006 regression 111/111 PASS + NAV-005 3A/3B/3C 47/47 PASS. Production public-surface verifications passed at every deploy checkpoint (P2B / P2C / P2D-core / F-008).
+
+**No further NAV-006 sprints planned. P2E NOT started.**
+
+
 ## 🧹 NAV-006 · F-008 · Legacy `sessions` Fallback Removal (2026-08-18)
 
 **Scope (user-approved)**: F-008 only. Remove the dead `db.sessions.find_one(...)` fallback from `hearing_report_versions.py::_load_session`. No P2E, no F-009, no F-011, no other feature.
