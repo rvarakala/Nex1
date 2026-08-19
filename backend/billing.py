@@ -272,8 +272,8 @@ async def record_payment_atomic(
     capture flows. Returns (updated_invoice_dict, payment_dict).
 
     Raises HTTPException on: non-finite / non-positive amount, missing
-    invoice, cancelled invoice, refunded invoice (no further payments),
-    or overpayment (payload > current due_total + MONEY_TOL).
+    invoice, cancelled invoice, or overpayment (payload > current
+    due_total + MONEY_TOL).
 
     Preserves the invariant `db.payments.payment_id == embedded
     invoice.payments[].payment_id` on success.
@@ -316,12 +316,12 @@ async def record_payment_atomic(
     match: dict = {
         "invoice_id": invoice_id,
         "clinic_id": clinic_id,
-        # Payments are only accepted on non-cancelled, non-refunded
-        # invoices. Product decision on `partially_refunded` deferred —
-        # for now we ALSO block `partially_refunded` to avoid an
-        # unapproved product-behaviour change; documented in the audit
-        # (finding NAV009-PAY-006 is P2, unchanged in Phase 2A).
-        "status": {"$nin": ["cancelled", "refunded", "partially_refunded"]},
+        # Payments are rejected only on cancelled invoices — matches the
+        # pre-NAV-009 behaviour. `refunded` / `partially_refunded`
+        # semantics are the P2 finding NAV009-PAY-006 and were NOT
+        # approved for Phase 2A; keeping them accepted here so this
+        # sprint does not silently change user-facing behaviour.
+        "status": {"$ne": "cancelled"},
     }
     if enforce_overpay:
         match["$expr"] = {"$gte": [
@@ -369,11 +369,6 @@ async def record_payment_atomic(
         st = (inv.get("status") or "").lower()
         if st == "cancelled":
             raise HTTPException(status_code=400, detail="Cannot add payment to a cancelled invoice")
-        if st in {"refunded", "partially_refunded"}:
-            raise HTTPException(
-                status_code=400,
-                detail=f"Cannot add payment to a {st} invoice",
-            )
         # Overpayment path.
         due = round(
             float(inv.get("rounded_total") or inv.get("grand_total") or 0)
