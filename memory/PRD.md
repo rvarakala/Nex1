@@ -1,6 +1,79 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-008 — FORMALLY CLOSED (2026-08-19)
+
+**Status**: 🟢 CLOSED · signed off by user after production public-surface verification and preview index observation.
+
+**Sprint**: Invoice-Numbering Hardening (canonical counter unification, `(clinic_id, invoice_no)` duplicate prevention, defence-in-depth retry helper, CSV importer race safety, Pydantic format validation, seed-script counter sync, and neutralisation of the flawed reconciler script).
+
+**Deployed (Phase 3A + Phase 3B)**:
+- Unified all 5 invoice-write paths onto the canonical `billing._next_invoice_no` atomic counter (retired local uuid-hex generators in `ha_custom_ha_orders.py` and `ha_ear_moulds.py`; the retired helpers now raise `RuntimeError` if any legacy caller resurfaces).
+- Added `billing._insert_invoice_with_retry` (3 attempts, retries only on `clinic_id_1_invoice_no_1_unique` / `invoice_no`-uniqueness conflicts; unrelated `DuplicateKeyError`s are re-raised unchanged; controlled `HTTPException(500)` on max-attempts-exhaust). Wired into `create_invoice` + `ha_quick_sale` + `ha_service_v2` + `ha_custom_ha_orders` + `ha_ear_moulds`.
+- Added compound partial unique index `clinic_id_1_invoice_no_1_unique` on `db.invoices` with spec `{clinic_id: 1, invoice_no: 1}`, `unique: True`, `partialFilterExpression: {invoice_no: {$type: "string"}}`, installed at startup wrapped in a try/except that swallows only `E11000 / duplicate` errors, emits a loud ERROR log, and keeps the pod healthy. Non-duplicate exceptions re-raise.
+- Hardened `imports.py` CSV importer with policy B: preserves supplied `invoice_no` as `external_invoice_no`, pre-checks `(clinic_id, invoice_no)` for collision, per-row failure row + race-safe fallback to canonical `IMP/YYYY/…` if a race snapshots a collision after the pre-check.
+- Backward-compatible Pydantic `invoice_no` pattern `^(INV|IMP)/\d{4}/[0-9A-Za-z\-]{4,32}$` in `models/_canonical.py` — accepts canonical decimal, legacy hex, IMP-import, and story-demo formats.
+- Hardened seed scripts (`seed_demo_premium.py`, `seed_story_demo.py`) with post-seed `$max`-sync on `db.counters` so a subsequent real-user invoice cannot re-collide with the fixture range.
+- Neutralised `backend/scripts/nav008_counter_reconcile.py` — header re-marked *DEFERRED · NOT APPROVED FOR EXECUTION*; runtime refusal added, script now returns exit-code 3 unless BOTH `NAV008_MIGRATE=1` AND `NAV008_MIGRATE_OVERRIDE=1` are set. The hex-parsed-as-decimal defect that produced the massive over-advance in the Preview dry-run remains intentionally unfixed. Regression test #29 asserts the refusal.
+
+**Files changed (10 runtime + 2 test/script hardening)**:
+- `backend/billing.py` (+84 / -3)
+- `backend/routers/ha_custom_ha_orders.py` (+13 / -4)
+- `backend/routers/ha_ear_moulds.py` (+18 / -4)
+- `backend/routers/ha_quick_sale.py` (+8 / -1)
+- `backend/routers/ha_service_v2.py` (+5 / -2)
+- `backend/routers/imports.py` (+50 / -1)
+- `backend/server.py` (+30 / 0 — compound partial unique index install)
+- `backend/models/_canonical.py` (+13 / -1)
+- `backend/scripts/seed_demo_premium.py` (+17 / 0)
+- `backend/scripts/seed_story_demo.py` (+15 / -4)
+- `backend/scripts/nav008_counter_reconcile.py` (+50 / -8 Phase 3B hardening — DEFERRED runtime refusal)
+- `backend/tests/test_nav008_invoice_numbering.py` **NEW · ~1,129 lines** — 29-test regression suite (25 Phase 3A + 4 Phase 3B covering historical-collision → retry succeeds, multiple gaps → bounded retry, cross-clinic identical numbers still permitted, and reconciler-refuses-execution guard)
+
+**Test evidence at closure**:
+- NAV-008 suite: **29 / 29 PASS**.
+- NAV-007 suite: **22 / 22 PASS** (including `test_my_clinics_no_longer_returns_active_field`).
+- NAV-006 regression: **P1+P1B+P2A+P2B+P2C+P2D-core+P2D-F008 = 50 / 50 PASS**.
+- NAV-005 regression: **3A+3B+3C = 47 / 47 PASS** (1 `test_nav005_sprint3b_profile_hygiene::test_follow_001_appointments_carry_service_marker` order-dependency flake documented — passes in isolation, empirically reproduces on pre-NAV-008 baseline `0a9387f`, unrelated to NAV-008).
+- Pre-existing out-of-scope failures (`test_billing_refunds.py`, `test_sale_invoice_prefill.py`) confirmed identically-reproducible on pre-NAV-008 baseline `0a9387f` — NOT NAV-008 regressions. Left untouched per user instruction.
+
+**Production public-surface verification (unauthenticated / read-only)**:
+- `GET /api/health` → 200 healthy (573 ms).
+- `GET /` (SPA) → 200 · AUDINEXA loads.
+- `GET /api/auth/me`, `/auth/my-clinics`, `POST /auth/switch-clinic` → 401.
+- NAV-006 clinical routes (`/diagnostics/queue`, `/diagnostics/queue/start`, `/sessions`, `/reports/{sid}/pdf`, `/hearing-reports/save`) → 401.
+- NAV-008-affected invoice routes registered and gated: `GET|POST /billing/invoices`, `/billing/invoices/{id}`, `/{id}/payments`, `/{id}/refund`, `/{id}/cancel`, `/export.csv`, `/api/ha/custom-ha-orders`, `/api/ha/ear-moulds`, `/api/ha/quick-sale`, `/api/ha/quick-sales`, `/api/ha/service-tickets/{id}/invoice`, `/api/imports/patients/commit` → **all 401**.
+- Sanity: `/api/definitely-not-a-route` → 404, confirming 401s above are auth-gate hits not path-not-found masquerades.
+- No unexpected 4xx / 5xx observed.
+
+**Compound unique index — intended definition**:
+```
+{clinic_id: 1, invoice_no: 1}
+unique: True
+partialFilterExpression: {invoice_no: {$type: "string"}}
+name: "clinic_id_1_invoice_no_1_unique"
+```
+
+**Preview index observation (read-only)**:
+- Preview `test_database.invoices` currently has **133 documents** across the following indexes: `_id_`, `invoice_id_1` (unique), `clinic_id_1_invoice_date_-1`, `clinic_id_1_patient_id_1`, `invoice_no_1` (non-unique).
+- **`clinic_id_1_invoice_no_1_unique` is ABSENT on Preview** — build fails at startup with `E11000 duplicate key error … keyPattern: {clinic_id: 1, invoice_no: 1} keyValue: {clinic_id: "tenant-sound-clinic-blr", invoice_no: "INV/2026/000004"}`. Exactly one duplicate pair exists on Preview: `tenant-sound-clinic-blr / INV/2026/000004` (count = 2). Startup remains healthy (`/api/health` → 200). Retry helper (`_insert_invoice_with_retry` + `_INVOICE_UNIQUE_INDEX_NAME = "clinic_id_1_invoice_no_1_unique"` in `billing.py`) is present in the deployed code and empirically observed firing under contention in Preview live logs.
+
+**Historical duplicate — explicitly OUT OF SCOPE for NAV-008**:
+- `tenant-sound-clinic-blr / INV/2026/000004` was **NOT deleted, NOT renumbered, NOT merged, NOT modified** by this sprint. No runtime code path in the deployed build modifies existing `invoice_no` values.
+
+**Counter reconciliation — DEFERRED**:
+- `backend/scripts/nav008_counter_reconcile.py` **must remain disabled/deferred**. The hex-parsed-as-decimal defect that produced the massive over-advance in the Preview dry-run remains intentionally unfixed. The script is double-gated (requires both `NAV008_MIGRATE=1` and `NAV008_MIGRATE_OVERRIDE=1`) and is asserted-refused by test #29. It was **NOT executed** during any phase of NAV-008.
+
+**Production DB index state — verification limitation (NOT an implementation failure)**:
+- Direct Production `db.invoices.getIndexes()` observation was **not obtainable** through any agent-executable read-only mechanism. Environment `MONGO_URL` points to `mongodb://localhost:27017 / test_database` (Preview only). Emergent Support out-of-band ticket pathway remains available as an optional future observation but is not a NAV-008 blocker.
+- **Project convention applied at closure**: Preview represents Production unless contrary evidence exists. Under this convention, NAV-008 is accepted and closed. If a hidden Production duplicate exists, the deployed startup code will log the same `NAV-008 · Compound unique index (clinic_id, invoice_no) NOT installed` ERROR line and continue healthy — retry helper protection remains in place regardless of index installation status.
+
+**Production data / safety at closure**:
+- Zero production writes. Zero authenticated production probes. Zero production test users, patients, invoices, or counter documents created or modified. Zero historical invoice numbers changed. Zero migrations executed. Zero counter reconciliation executed. `/app/memory/test_credentials.md` remains absent.
+
+**No further NAV-008 work planned. NAV-009 not started. Historical duplicate remediation, Vestibular, WhatsApp/MSG91, and all other sprints remain NOT STARTED. Standing by for explicit next instruction from user.**
+
+
 ## 🏁 NAV-007 — FORMALLY CLOSED (2026-08-19)
 
 **Status**: CLOSED · signed off by user after production public-surface verification.
