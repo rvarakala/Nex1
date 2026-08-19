@@ -1,6 +1,128 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-010 — FORMALLY CLOSED (2026-08-19)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview regression, manual Production deployment, and read-only Production post-deployment verification.
+
+**Title**: NAV-010 — Inventory Hardening · Phase 2A
+**Production status**: DEPLOYED AND POST-DEPLOYMENT VERIFIED
+**Final verification status**: 🟡 PASS WITH OBSERVATION — Production application health, SPA availability, authentication boundaries, and NAV-010 route registration/reachability were directly verified via unauthenticated read-only probes. NAV-010 routes (including the new INV-005 `POST /api/ha/quick-sales/{id}/cancel` and the INV-006-modified `POST /api/billing/invoices/{id}/cancel`) are confirmed live on Production, gated by auth (401 on synthetic dummy IDs). Production authenticated inventory / data-plane behaviour (the 200/403/409 contracts BEHIND the 401 gate) was **NOT directly exercised** on Production — zero authenticated financial or inventory writes were performed. INV-001..INV-008 behavioural correctness is supported by Preview/code-level verification and the 32/32 targeted regression suite. Production commit SHA is not independently verifiable from the public surface (no deployed `/api/health/build` endpoint). This limitation is documented, is consistent with the established "Preview represents Production unless contrary evidence" project convention (see NAV-009 closure block line 10), and is NOT a NAV-010 implementation failure or deployment blocker.
+
+**Sprint approved scope (Phase 2A · 8 findings)**:
+- **NAV010-INV-001** (P0) — Atomic compare-and-swap on `transition_serial(...)`: the `serial_items` update now matches on `(serial_id, state=from_state)` so two concurrent transitions from the same source state cannot both succeed. `matched_count == 0` surfaces a controlled 409 with the fresh actual state; the audit `serial_events` write remains append-only. Closes the read-modify-write lost-update race on serial state.
+- **NAV010-INV-002** (P1) — Stock-transfer RBAC: `POST /api/stock-transfers` (create) and `POST /api/stock-transfers/{id}/dispatch` now `require_roles("inventory_manager", "clinic_owner")`; `POST /api/stock-transfers/{id}/receive` additionally allows `"front_desk"` per product decision. `super_admin` / `founder` continue to bypass via `require_roles`. Audiologist blocked on all three surfaces.
+- **NAV010-INV-003** (P0) — Atomic accessory reservation at invoice-creation time via new `reserve_accessory_stock_atomic(...)`: each accessory line does an atomic `find_one_and_update({sku, qty_on_hand: {$gte: qty}}, {$inc: -qty})`. Concurrent same-sku reservations produce exactly one success + one 409. Successful reservations set `InvoiceLine.accessory_stock_decremented=True` so the legacy paid-transition helper skips them (no double-decrement).
+- **NAV010-INV-004** (P1) — Atomic accessory manual adjustment: `POST /api/ha/accessory-stock/{sku}/adjust` now uses `find_one_and_update` with a `qty_on_hand: {$gte: -delta}` guard on negative deltas. Concurrent adjustments cannot lost-update each other; a negative delta exceeding available qty returns 409 with zero mutation.
+- **NAV010-INV-005** (P0) — Quick Sale cancellation two-phase state machine. New endpoint `POST /api/ha/quick-sales/{quick_sale_id}/cancel`, tight RBAC (`clinic_owner + super_admin + founder`). Two-phase LOCK → PRE-FLIGHT → COMMIT: (A) CAS-flip `cancellation_state` from unset → `"cancelling"` on `ha_quick_sales` (concurrent second caller → 409); (B) read-only pre-flight verifies every consumed serial is still SOLD, the linked invoice is not already cancelled, has no system-recorded refund row (embedded or top-level `db.payments`), and requires `confirm_refund_offline=true` when `paid_total > 0` — any failure releases the lock and returns 409 with zero mutation; (C) ordered commit: (1) serial reversal `SOLD → RETURNED` per serial via CAS `transition_serial()`; (2) accessory reversal via `restore_accessory_stock()`; (3) ONE `payment_reversals` row PER embedded payment with `kind="cancellation_reversal"`, preserving `original_payment_id` — original payment rows are NEVER modified; (4) invoice cancel (`status=cancelled`, `due_total=0`, `cancellation_reversal_ids[]` — `paid_total` / `refunded_total` / `grand_total` / `invoice_no` UNTOUCHED); (5) quick-sale + fitting cancel. Mid-serial-reversal race halts with 500 + lock retained (documented recovery-ergonomics gap, P2 operational-tooling scope for a future sprint, NOT a safety defect — financial integrity fully preserved).
+- **NAV010-INV-006** (P0) — Generic invoice cancellation HARD BLOCK on inventory footprint. `POST /api/billing/invoices/{id}/cancel` now returns HTTP 409 BEFORE any mutation if the invoice has ANY of: `source == "ha_quick_sale"` OR `ha_quick_sale_id` set OR `linked_sale_no` set OR any line has `accessory_stock_decremented=True`. Historical footprint interpretation (strict / safest): even if a serial has been reverted out-of-band, the invoice remains blocked. Operators must use the controlled inventory cancellation workflow (`/api/ha/quick-sales/{id}/cancel` or `/api/ha/sales/{sale_no}/cancel`).
+- **NAV010-INV-007** (P0) — Strict-reject accessory shortage at invoice creation (bundled with INV-003 implementation). Insufficient stock → HTTP 409 with zero side-effects (no invoice inserted, no payment persisted, no stock mutation). Multi-line invoices where an earlier accessory line succeeds and a later line fails receive full compensating `$inc: +qty` rollback of prior reservations before the 409 raises. Also unwinds a previously-inserted initial-payment top-level `db.payments` row on rejection so no orphan lingers.
+- **NAV010-INV-008** (P1) — Stock-request RBAC: `POST /api/stock-requests` now `require_roles("front_desk", "accounts", "clinic_owner", "inventory_manager")`. Audiologist blocked. `super_admin` / `founder` bypass via `require_roles`.
+
+**Files changed (final)**:
+- `backend/utils/ha_states.py` — added CAS on `(serial_id, state=from_state)` inside `transition_serial()`; `matched_count == 0` raises 409 with the fresh state.
+- `backend/routers/stock_transfers.py` — tightened `create` / `dispatch` to `inventory_manager + clinic_owner`; `receive` additionally admits `front_desk`.
+- `backend/routers/stock_requests.py` — `create_request` now `require_roles("front_desk", "accounts", "clinic_owner", "inventory_manager")`.
+- `backend/utils/accessory_stock.py` — new `reserve_accessory_stock_atomic()` (strict-reject, compensating rollback) + new `restore_accessory_stock()` (used by INV-005). Fixed a `_resolve_product` → `_resolve_accessory_product` typo that would have crashed at runtime for every accessory invoice.
+- `backend/routers/ha_inventory.py` — `adjust_accessory_stock` rewritten to atomic `find_one_and_update` with `$gte` guard on negative deltas.
+- `backend/billing.py` — `create_invoice` now calls `reserve_accessory_stock_atomic` BEFORE `insert_one`, unwinding the initial-payment top-level row on 409. `cancel_invoice` now HARD BLOCKS (409) if the invoice has any inventory footprint.
+- `backend/routers/ha_quick_sale.py` — new `CancelQuickSaleIn` / `CancelQuickSaleOut` models and `POST /quick-sales/{quick_sale_id}/cancel` handler implementing the two-phase LOCK / PRE-FLIGHT / COMMIT state machine. Writes to the new `db.payment_reversals` collection (Mongo auto-creates on first insert).
+- `backend/tests/test_nav010_inventory_hardening.py` **NEW · 32 tests · 1,034 lines** — targeted regression covering every approved finding INV-001 through INV-008 (concurrent-race, RBAC deny/allow, multi-line compensating rollback, cancellation happy-path + edge cases + RBAC + originals-preserved verification, hard-block matrix).
+- `backend/tests/test_accessories_preset_autodec.py` — test-realignment (NOT scope-creep): renamed `test_shortfall_floors_to_zero` → `test_shortfall_returns_409_no_side_effects` and updated `test_partial_to_paid_transition` to verify the new immediate-reservation + idempotency semantics. Both tests previously locked in the OLD "silent floor to zero" / "lazy decrement on paid transition" behaviours that INV-003 / INV-007 explicitly retired per approved scope.
+- `backend/tests/test_accessory_sales_rollup.py` — test-realignment: `test_draft_invoice_with_accessory_fields_persists` now best-effort seeds stock on the picked (product, variant) row before creating the invoice so the picker-fields-persist assertion is not blocked by the new INV-003 reservation gate; also updated `accessory_stock_decremented` assertion from `False`/`None` → `True` because reservation now happens on create.
+
+**Regression results (final)**:
+- NAV-005 = **47/47 PASS**
+- NAV-006 = **59/64** (5 pre-existing baseline failures: `test_F001_two_appointments_same_patient_show_as_two_cards`, `test_F001_same_appointment_via_multiple_sources_stays_one_card`, `test_F001_different_patients_stay_separate`, `test_F002_case_A_no_appointment_id_auto_discovers`, `test_B1_5_no_appointment_id_supplied_auto_discovers` — all reproduced identically on baseline `f4d02ad` via `git stash`, zero cross-reference to any NAV-010-modified file, classified as PRE-EXISTING / OUT OF SCOPE / NO NAV-010 REGRESSION per the Final Review Gate §2)
+- NAV-007 = **22/22 PASS**
+- NAV-008 = **29/29 PASS**
+- NAV-009 = **20/20 PASS**
+- **NAV-010 (this sprint) = 32/32 PASS**
+- **Combined NAV-005..NAV-010 = 209/214 PASS** — the 5 remaining non-passes are the pre-existing NAV-006 baseline failures documented above; they are NOT hidden, rewritten, or reclassified as NAV-010 failures.
+- **Adjacent inventory + billing suites = 88/88 PASS** (`test_accessories_inventory.py`, `test_accessories_preset_autodec.py`, `test_accessory_lifecycle.py`, `test_accessory_sales_rollup.py`, `test_clinic_groups_stock_requests.py`, `test_ha_inventory_500_regression.py`, `test_invoice_product_details.py`, `test_invoice_payment_legacy_tolerance.py`, `test_serial_invoice_link.py`).
+- Pre-existing / batch-order flakes documented in NAV-009 closure line 36 (hardcoded-phone collisions in `test_billing_refunds.py`, demo-seed dependencies in the `test_phase*` and `test_iter*` families) remain unchanged — NOT hidden, NOT altered, NOT modified by NAV-010.
+
+**Production deployment**:
+- Manual Production deployment performed by the user.
+- Emergent did NOT perform the deployment.
+
+**Production post-deployment verification (unauthenticated, read-only)**:
+- `GET /api/health` → **200 healthy**, timestamp `2026-08-19T19:30:46.206108+00:00`.
+- `GET /` (SPA) → **200 · `<title>AUDINEXA — Audiology Clinic OS</title>`**, main bundle `static/js/main.dc4d49f0.js`, manifest + icons intact.
+- NAV-005 → NAV-009 protected surfaces intact: 14 legacy protected routes all return 401 with `{"detail":"Not authenticated"}`.
+- NAV-010 routes live and auth-gated: `GET /api/ha/quick-sales`, `POST /api/ha/quick-sale`, `GET /api/ha/serial-items`, `POST /api/ha/serial-items/{id}/transition`, `GET /api/ha/accessory-stock`, `POST /api/ha/accessory-stock/{sku}/adjust`, `GET /api/stock-transfers`, `POST /api/stock-transfers`, `GET /api/stock-requests`, `POST /api/stock-requests` — all 401.
+- **INV-005 Quick Sale cancellation endpoint confirmed LIVE on Production**: `POST /api/ha/quick-sales/NAV010-DUMMY-QS-DO-NOT-USE/cancel` → **401** (route deployed and gated).
+- **INV-006 invoice-cancellation endpoint confirmed LIVE on Production**: `POST /api/billing/invoices/NAV010-DUMMY-INVOICE-DO-NOT-USE/cancel` → **401** (route deployed; the 409 hard-block gate lives BEHIND the auth barrier).
+- **Total Production probes: 39** — 2 expected 200 (health + root); 25 expected 401 auth-gate responses; 1 deliberate nonexistent-route control probe returning 404 (confirming the 401s are genuine auth-gate hits, not missing-route masquerades); 5 initial-guess incorrect-path probes returning 404 (transparently disclosed as verifier path assumptions — NOT NAV-010 regressions; actual live paths are `/api/ha/serial-items`, `/api/ha/accessory-stock`, `/api/stock-transfers`, `/api/stock-requests` and all returned 401 as expected); 6 expected 404 version/build endpoint probes (`/api/health/build`, `/api/version`, `/api/commit`, `/api/health/version`, `/api/build`, `/api/health/build-info` — no public version endpoint deployed).
+- **0 unexpected 4xx · 0 5xx · 0 502 / 503 / 504 · 0 routing / authentication anomalies.**
+- Sanity control `GET /api/NAV010-definitely-nonexistent-route` → 404, confirming above 401s are auth-gate hits.
+
+**Production data safety (this closure + the entire NAV-010 verification cycle)**:
+- Zero authenticated Production requests.
+- Zero Production writes.
+- Zero invoices created.
+- Zero payments created.
+- Zero refunds created.
+- Zero inventory created.
+- Zero serial modifications.
+- Zero accessory stock modifications.
+- Zero stock transfers created.
+- Zero stock requests created.
+- Zero invoice cancellations.
+- Zero Quick Sale cancellations.
+- Zero migrations executed.
+- Zero counter reconciliation.
+- Zero historical-data cleanup.
+- Zero deletion of any kind.
+
+**Historical data safety**:
+- **`tenant-sound-clinic-blr / INV/2026/000004`** was NOT queried, modified, deleted, renumbered, merged, or otherwise touched during any NAV-010 preview build, regression, verification, or closure action.
+- 82 pre-existing orphan payments on `tenant-sound-clinic-blr` / `BR-CL-4601C9DF` — NOT touched.
+- Legacy `sessions` collection (removed in NAV-006 F-008) — NOT re-introduced.
+- Historical invoices NOT modified, NOT renumbered, NOT merged.
+- Historical payments NOT modified.
+- No orphan-payment cleanup executed.
+- No counter reconciler executed.
+
+**Verification limitation / PASS WITH OBSERVATION (preserve exactly)**:
+
+*DIRECTLY VERIFIED ON PRODUCTION*
+- Production application health (`GET /api/health` → 200 healthy).
+- SPA availability (`GET /` → 200, correct title + asset stack).
+- Authentication boundaries (25 protected routes → 401; 1 nonexistent-route control → 404).
+- NAV-005 through NAV-009 protected API surfaces (14 probes all 401 as expected).
+- NAV-010 route registration and reachability (every NAV-010-introduced / -modified route responds 401 on synthetic dummy IDs, confirming deployment and auth-gating).
+- **INV-005 route live on Production.**
+- **INV-006 route live on Production.**
+- Zero-write safety during verification.
+
+*PREVIEW / CODE-LEVEL VERIFIED (NOT directly exercised on Production data plane)*
+- INV-001 through INV-008 behavioural contracts (the 200 / 403 / 409 semantics behind the 401 gate).
+- Concurrency protections (INV-001 CAS, INV-003 atomic reservation, INV-004 atomic adjust).
+- RBAC allow/deny paths (INV-002, INV-005, INV-008).
+- INV-005 two-phase LOCK / PRE-FLIGHT / COMMIT cancellation state machine + per-payment `cancellation_reversal` audit row semantics.
+- INV-006 inventory-footprint cancellation hard-block matrix.
+- Accessory reservation + compensating rollback behaviour (INV-003 / INV-007 multi-line partial failure).
+
+*NOT INDEPENDENTLY VERIFIED*
+- Production authenticated inventory / data-plane behaviour (zero authenticated Production writes performed).
+- Production commit SHA (no `/api/health/build` or equivalent public endpoint deployed).
+
+**We do NOT claim authenticated NAV-010 business logic was Production-tested.** The PASS WITH OBSERVATION verdict reflects this boundary exactly, consistent with the NAV-009 closure posture (line 10).
+
+**Backlog / deferred (recorded, NOT implemented)**:
+- NAV-010 Phase 2B — INV-009 through INV-018 (indexing on `stock_requests` / `serial_events` / `accessory_events`, tenant-scoped audit rows, `_branch_scope` deduplication, etc.).
+- Payment / refund `Idempotency-Key` hardening.
+- Historical orphan-payment cleanup (82 rows on `tenant-sound-clinic-blr` / `BR-CL-4601C9DF`).
+- Historical invoice cleanup (duplicate `INV/2026/000004`).
+- NAV-008 counter reconciliation execution.
+- Remaining inventory indexing / audit enhancements identified in the read-only audit.
+- NAV-011 — Referral Payouts / revenue-attribution hardening.
+- Vestibular / VEMP / VNG / vHIT / Posturography / Rehab modules (POSTPONED by product decision).
+- WhatsApp / MSG91 live integration (POSTPONED — currently MOCKED).
+
+
+
 ## 🏁 NAV-009 — FORMALLY CLOSED (2026-08-19)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview regression, manual Production deployment, and read-only Production post-deployment verification.
