@@ -1712,7 +1712,7 @@ async def export_clinic_assignments_csv(
             all_ids.add(cid)
     clinics = await db.clinics.find(
         {"clinic_id": {"$in": list(all_ids)}},
-        {"_id": 0, "clinic_id": 1, "name": 1, "city": 1, "state": 1, "subscription_tier": 1, "active": 1},
+        {"_id": 0, "clinic_id": 1, "name": 1, "city": 1, "state": 1, "subscription_tier": 1, "status": 1},
     ).to_list(len(all_ids) or 1)
     cmap = {c["clinic_id"]: c for c in clinics}
 
@@ -1726,13 +1726,19 @@ async def export_clinic_assignments_csv(
 
     def _write(u, cid, kind):
         c = cmap.get(cid) or {}
+        # NAV-007 · B6 · Derive clinic_active from `status` instead of
+        # the phantom `active` field. Legacy rows with missing status
+        # continue to render as `yes` (correct — they've been operational
+        # for months).
+        _status = c.get("status")
+        _active = "no" if _status in {"inactive", "suspended"} else "yes"
         writer.writerow([
             u.get("user_id", ""), u.get("email", ""), u.get("name", ""),
             u.get("role", ""), "yes" if u.get("active", True) else "no",
             kind, cid or "", c.get("name", ""),
             c.get("city", ""), c.get("state", ""),
             c.get("subscription_tier", ""),
-            "yes" if c.get("active", True) else "no",
+            _active,
             u.get("created_at", ""),
         ])
 

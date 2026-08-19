@@ -117,6 +117,69 @@ def create_access_token(
 MFA_ENFORCED_ROLES = {"super_admin", "founder"}
 MFA_GRACE_DAYS = 7
 
+# ──────────────────────────────────────────────────────────────────────
+# NAV-007 · Multi-Branch deactivation gate
+# ──────────────────────────────────────────────────────────────────────
+# When a branch clinic is deactivated (POST /api/clinic-groups/mine/
+# branches/{id}/deactivate) or a whole tenant is suspended by the
+# founder (POST /api/admin-panel/tenants/{id}/suspend), the clinic doc
+# receives `status="inactive"` or `status="suspended"`. Every
+# authenticated request that resolves to such a clinic must be rejected
+# 401, regardless of how the JWT was minted or how recent the session
+# is. Enforced centrally so every FastAPI dependency transitively
+# depending on get_current_user() inherits the check.
+#
+# Legacy tolerance is CRITICAL: the audit found 14/23 preview clinics
+# with no `status` field at all (pre-2026 rows). Missing/None must PASS
+# — do NOT switch this to an active-only whitelist.
+_INACTIVE_CLINIC_STATUSES = {"inactive", "suspended"}
+
+# Break-glass kill switch. NOT user-configurable, NOT exposed in the
+# frontend, NOT documented as a normal config option. Set only via a
+# manual pod-env edit in a security incident. When enabled the central
+# gate below becomes a no-op AND an explicit ERROR log fires on every
+# authenticated request so ops can spot accidental enablement fast.
+# Env var name deliberately verbose so it never appears in a normal
+# .env file by accident.
+def _multi_branch_inactive_enforcement_disabled() -> bool:
+    import os
+    return os.environ.get("MULTI_BRANCH_INACTIVE_ENFORCEMENT_DISABLED") == "1"
+
+
+async def _reject_if_clinic_inactive(db, clinic_id: str) -> None:
+    """Raise 401 when the caller's active clinic is inactive/suspended.
+
+    Status handling (per NAV-007 approved plan):
+      - "active"           → PASS
+      - missing / None     → PASS  (legacy pre-status rows)
+      - "inactive"         → 401
+      - "suspended"        → 401
+      - any other value    → PASS  (conservative — never lock users out
+                                     on typos or future statuses)
+
+    Break-glass: if MULTI_BRANCH_INACTIVE_ENFORCEMENT_DISABLED=1 is set
+    in the environment, the check is skipped AND a loud error is logged
+    so accidental enablement is visible in ops dashboards.
+    """
+    if _multi_branch_inactive_enforcement_disabled():
+        import logging
+        logging.getLogger(__name__).error(
+            "SECURITY: NAV-007 inactive-clinic enforcement is DISABLED via "
+            "MULTI_BRANCH_INACTIVE_ENFORCEMENT_DISABLED env var. "
+            "Deactivated branches are currently accessible. "
+            "Re-enable IMMEDIATELY unless actively debugging a lockout."
+        )
+        return
+    doc = await db.clinics.find_one(
+        {"clinic_id": clinic_id},
+        {"_id": 0, "status": 1},
+    )
+    if doc and doc.get("status") in _INACTIVE_CLINIC_STATUSES:
+        raise HTTPException(
+            status_code=401,
+            detail="This clinic is no longer active. Please contact your head clinic.",
+        )
+
 # 2026-06-03 — operator-controlled kill switch for the 2FA grace-period
 # enforcement. The founder was repeatedly running into the post-grace 403
 # while we iterated on production, and the dict-shaped error payload was
@@ -269,6 +332,13 @@ async def get_current_user(request: Request):
         allowed.add(cid)
     if payload.get("clinic_id") not in allowed:
         raise HTTPException(status_code=401, detail="Tenant mismatch")
+
+    # NAV-007 · Reject if the caller's active clinic has been deactivated
+    # or suspended. Runs BEFORE token_version/session checks so that a
+    # revoked-plus-reactivated user cannot exploit a race; runs AFTER the
+    # allowlist check so we never leak the existence of a clinic the user
+    # never had access to.
+    await _reject_if_clinic_inactive(db, payload["clinic_id"])
 
     # Force-logout check: if user's token_version was bumped after this token
     # was issued, reject (user must re-login)

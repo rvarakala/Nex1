@@ -743,12 +743,27 @@ async def my_clinics(user=Depends(get_current_user)):
 
     Used by the top-nav clinic-switcher dropdown. Includes the *active*
     clinic_id so the UI can highlight it.
+
+    NAV-007 · B4 · Clinics with `status in {"inactive","suspended"}` are
+    filtered out. Clinics with a missing/null `status` PASS through
+    (legacy tolerance — 14/23 preview clinics predate the `status`
+    field and are legitimately active).
+    NAV-007 · B6 · The phantom `clinics.active` field is no longer
+    projected; the switcher UI reads `clinic_id / name / city / state /
+    subscription_tier` only.
     """
     ids = list({user["primary_clinic_id"], *user.get("additional_clinic_ids", [])})
     clinics = await db.clinics.find(
-        {"clinic_id": {"$in": ids}},
+        {
+            "clinic_id": {"$in": ids},
+            "$or": [
+                {"status": {"$exists": False}},
+                {"status": None},
+                {"status": {"$nin": ["inactive", "suspended"]}},
+            ],
+        },
         {"_id": 0, "clinic_id": 1, "name": 1, "city": 1, "state": 1,
-         "logo_fs_id": 1, "subscription_tier": 1, "active": 1},
+         "logo_fs_id": 1, "subscription_tier": 1, "status": 1},
     ).to_list(len(ids))
     return {
         "active_clinic_id": user["clinic_id"],
@@ -782,10 +797,21 @@ async def switch_clinic(
         raise HTTPException(status_code=403, detail="You don't have access to that clinic")
 
     clinic = await db.clinics.find_one(
-        {"clinic_id": target}, {"_id": 0, "clinic_id": 1, "name": 1},
+        {"clinic_id": target}, {"_id": 0, "clinic_id": 1, "name": 1, "status": 1},
     )
     if not clinic:
         raise HTTPException(status_code=404, detail="Clinic not found")
+
+    # NAV-007 · B5 · Reject switches into deactivated / suspended tenants
+    # BEFORE minting a fresh JWT. The central inactive-clinic gate in
+    # auth.get_current_user (B1) would also reject any token minted here,
+    # but blocking at this endpoint avoids polluting `clinic_switch_audit`
+    # with successful-looking rows that immediately die.
+    if clinic.get("status") in {"inactive", "suspended"}:
+        raise HTTPException(
+            status_code=403,
+            detail="That clinic is no longer active. Please contact your head clinic.",
+        )
 
     # Capture the *from* clinic name while we still hold the old context.
     from_clinic = await db.clinics.find_one(

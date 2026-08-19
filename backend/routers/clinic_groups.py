@@ -40,6 +40,13 @@ from utils.serde import serialize_datetime
 
 router = APIRouter(prefix="/api/clinic-groups")
 
+# NAV-007 · Values written to `clinics.status` that mean "no
+# authenticated access allowed". Mirror of the constant in auth.py
+# used by the central inactive-clinic gate — kept local to avoid a
+# circular import back into the auth module. If auth.py's list ever
+# changes, update this one too.
+_INACTIVE_STATUSES = {"inactive", "suspended"}
+
 # Roles at the head clinic that should get auto-granted access to every
 # newly-created branch. Front-desk / audiologist / receptionist stay
 # single-clinic so day-to-day staff don't accidentally see other branches.
@@ -108,8 +115,19 @@ async def _grant_head_admins_access(db, head_clinic_id: str, new_branch_id: str)
 
 
 async def _revoke_head_admins_access(db, head_clinic_id: str, branch_id: str) -> int:
+    """NAV-007 · Widened at deactivation time.
+
+    Pulls `branch_id` from `additional_clinic_ids` of EVERY user platform-
+    wide who has it — head-clinic head-admins (original behaviour), plus
+    cross-clinic accountants linked via /auth/link-clinic, plus platform
+    super_admins who had the branch in extras.
+
+    Users whose primary_clinic_id equals the branch are NOT touched here;
+    their access dies via the central inactive-clinic gate in
+    auth.get_current_user (B1). Name kept for git-diff minimality.
+    """
     res = await db.users.update_many(
-        {"clinic_id": head_clinic_id, "role": {"$in": list(_HEAD_ADMIN_ROLES)}},
+        {"additional_clinic_ids": branch_id},
         {"$pull": {"additional_clinic_ids": branch_id}},
     )
     return int(res.modified_count or 0)
@@ -344,8 +362,26 @@ async def deactivate_branch(
     db=Depends(get_db),
 ):
     """Soft-remove a branch. Marks its `status='inactive'`, revokes
-    switcher access, and pulls it from the group members list. Data
-    stays in mongo for audit. Use this instead of a hard delete.
+    switcher access, pulls it from the group members list, and revokes
+    open user_sessions whose active clinic was this branch. Data stays
+    in mongo for audit. Use this instead of a hard delete.
+
+    NAV-007 hardening (2026-08-19):
+      - `_revoke_head_admins_access` now pulls `branch_id` from EVERY
+        user's `additional_clinic_ids` (was head-admin-only).
+      - `user_sessions` rows whose `clinic_id == branch_id` are marked
+        `revoked_at=now, revoke_reason="branch_deactivated"` so the
+        stored session-revocation gate in auth.get_current_user
+        rejects any JWT bearing that `sid`. Sessions scoped to OTHER
+        clinics for multi-clinic users are UNTOUCHED — a user with
+        active sessions in the head + branch A + branch B continues
+        to work in head and branch B after branch A is deactivated.
+      - `token_version` is NOT bumped. Bumping would forcibly log
+        multi-clinic users out of their unrelated active-clinic
+        sessions. The central inactive-clinic gate in
+        auth.get_current_user (B1) covers any pre-existing JWT
+        scoped to the deactivated branch, including tokens minted
+        without a `sid` claim.
     """
     head_clinic_id = user["clinic_id"]
     group = await _load_group_for_head(db, head_clinic_id)
@@ -355,23 +391,120 @@ async def deactivate_branch(
         raise HTTPException(status_code=404, detail="Branch not part of your group")
 
     now = datetime.now(timezone.utc)
+    # (1) Flag the tenant inactive — read by the central auth gate.
     await db.clinics.update_one(
         {"clinic_id": branch_id},
         {"$set": {"status": "inactive", "deactivated_at": now.isoformat()}},
     )
+    # (2) Drop the branch from the group listing.
     await db.clinic_groups.update_one(
         {"group_id": group["group_id"]},
         {"$pull": {"member_clinic_ids": branch_id}, "$set": {"updated_at": now.isoformat()}},
     )
+    # (3) SURGICAL session revocation — only sessions whose ACTIVE clinic
+    #     is the branch being deactivated. Multi-clinic users' sessions
+    #     on OTHER clinics stay alive.
+    sessions_res = await db.user_sessions.update_many(
+        {"clinic_id": branch_id, "revoked_at": None},
+        {"$set": {
+            "revoked_at": now.isoformat(),
+            "revoke_reason": "branch_deactivated",
+        }},
+    )
+    sessions_revoked = int(sessions_res.modified_count or 0)
+    # (4) Pull the branch from every user's additional_clinic_ids list
+    #     (widened at B2). Prevents post-deactivation switch-clinic
+    #     entitlement.
     revoked = await _revoke_head_admins_access(db, head_clinic_id, branch_id)
 
     await db.activity_logs.insert_one(serialize_datetime({
         "clinic_id": head_clinic_id, "user_id": user["user_id"],
         "action": "clinic_group.deactivate_branch",
         "group_id": group["group_id"], "branch_clinic_id": branch_id,
-        "revoked_from_users": revoked, "at": now,
+        "revoked_from_users": revoked,
+        "sessions_revoked": sessions_revoked,
+        "at": now,
     }))
-    return {"ok": True, "revoked_from_users": revoked}
+    return {
+        "ok": True,
+        "revoked_from_users": revoked,
+        "sessions_revoked": sessions_revoked,
+    }
+
+
+@router.post("/mine/branches/{branch_id}/reactivate")
+async def reactivate_branch(
+    branch_id: str,
+    user=Depends(require_roles("clinic_owner")),
+    db=Depends(get_db),
+):
+    """NAV-007 · G1 · Restore a previously-deactivated branch to service.
+
+    Symmetric to `deactivate_branch` at the branch/group level:
+      1. Set `clinics.status` back to "active"; unset `deactivated_at`.
+      2. `$addToSet` the branch back into `clinic_groups.member_clinic_ids`.
+      3. Re-grant head-admin switcher access via the existing helper.
+      4. Audit-log the event.
+
+    Explicitly NOT done (design rationale documented inline):
+      - `user.active` is NEVER modified. A user who was manually
+        deactivated before or during branch deactivation must stay
+        deactivated after reactivation. This is the guardrail the
+        NAV-007 audit called out as R3.
+      - `token_version` is NOT rolled back. Fresh logins mint fresh
+        JWTs naturally; existing tv state (which was untouched at
+        deactivation anyway) is preserved.
+      - `user_sessions` rows revoked at deactivation stay revoked.
+        Users get fresh sessions on their next login.
+      - Non-head-admin `additional_clinic_ids` grants (e.g. cross-
+        clinic accountants linked via /auth/link-clinic) are NOT
+        auto-restored. Those grants were discretionary; the granting
+        admin must re-link them explicitly. Matches Google Workspace
+        / AWS IAM lifecycle semantics.
+
+    Idempotent — repeated calls on an already-active branch return
+    `{ok:True, already_active:True}` with no writes. Foreign branches
+    (parent_clinic_id ≠ caller's head) return 404.
+    """
+    head_clinic_id = user["clinic_id"]
+    group = await _load_group_for_head(db, head_clinic_id)
+    if not group:
+        raise HTTPException(status_code=404, detail="No group under this clinic")
+
+    # Foreign-branch guard — `member_clinic_ids` was pulled at
+    # deactivation, so we can't use it. `parent_clinic_id` is the
+    # immutable ownership link stamped at branch creation.
+    branch = await db.clinics.find_one(
+        {"clinic_id": branch_id, "parent_clinic_id": head_clinic_id},
+        {"_id": 0, "clinic_id": 1, "status": 1},
+    )
+    if not branch:
+        raise HTTPException(status_code=404, detail="Branch not part of your group")
+
+    current_status = branch.get("status")
+    if current_status not in _INACTIVE_STATUSES:
+        return {"ok": True, "already_active": True}
+
+    now = datetime.now(timezone.utc)
+    await db.clinics.update_one(
+        {"clinic_id": branch_id},
+        {"$set": {"status": "active"}, "$unset": {"deactivated_at": ""}},
+    )
+    await db.clinic_groups.update_one(
+        {"group_id": group["group_id"]},
+        {"$addToSet": {"member_clinic_ids": branch_id},
+         "$set": {"updated_at": now.isoformat()}},
+    )
+    granted = await _grant_head_admins_access(db, head_clinic_id, branch_id)
+
+    await db.activity_logs.insert_one(serialize_datetime({
+        "clinic_id": head_clinic_id, "user_id": user["user_id"],
+        "action": "clinic_group.reactivate_branch",
+        "group_id": group["group_id"], "branch_clinic_id": branch_id,
+        "granted_switcher_to_users": granted,
+        "at": now,
+    }))
+    return {"ok": True, "granted_switcher_to_users": granted}
 
 
 
