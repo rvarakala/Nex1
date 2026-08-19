@@ -73,9 +73,20 @@ def _new_order_no(clinic_id: str) -> str:
 
 
 def _new_invoice_no(clinic_id: str) -> str:
-    """Slot into the same numbering series as the invoice generator."""
-    year = datetime.now(timezone.utc).year
-    return f"INV/{year}/{uuid.uuid4().hex[:6].upper()}"
+    """DEPRECATED · NAV-008 · Kept as an inert shim for any legacy caller.
+    All new callers must import `billing._next_invoice_no` and pass the
+    live DB. This local generator was the root of NAV008-INV-001 —
+    format-namespace collision with the atomic counter.
+    """
+    raise RuntimeError(
+        "ha_ear_moulds._new_invoice_no is retired (NAV-008). "
+        "Use billing._next_invoice_no(db, clinic_id) instead."
+    )
+
+
+# NAV-008 · Ear-mould-order invoice numbering must go through the
+# canonical atomic counter. Import + retry helper.
+from billing import _next_invoice_no, _insert_invoice_with_retry  # noqa: E402
 
 
 # ── Endpoints ─────────────────────────────────────────────────────────
@@ -120,7 +131,7 @@ async def create_ear_mould_order(
     cgst = round(tax_total / 2, 2)
     sgst = round(tax_total - cgst, 2)
     invoice_id = f"INV-{uuid.uuid4().hex[:10].upper()}"
-    invoice_no = _new_invoice_no(user["clinic_id"])
+    invoice_no = await _next_invoice_no(db, user["clinic_id"])
 
     paid = round(float(payload.advance_amount), 2)
     balance = round(total - paid, 2)
@@ -202,7 +213,8 @@ async def create_ear_mould_order(
         "created_at": now,
         "created_by_user_id": user["user_id"],
     }
-    await db.invoices.insert_one(invoice_doc)
+    await _insert_invoice_with_retry(db, invoice_doc, user["clinic_id"])
+    invoice_no = invoice_doc["invoice_no"]
 
     # ── Order doc (soft workflow tracker) ──
     order_doc = {

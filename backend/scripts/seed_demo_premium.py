@@ -688,6 +688,16 @@ async def seed():
     await db.ha_sales.insert_many(sale_docs)
     if invoice_docs:
         await db.invoices.insert_many(invoice_docs)
+        # NAV-008 · Sync the atomic invoice counter to the max seq we
+        # just assigned. This closes the class of duplicates caused by
+        # the seed bypassing `_next_invoice_no` (root cause of the
+        # observed Preview `INV/2026/000004` collision). Uses `$max` so
+        # a later real-user invoice cannot collide with a lower value.
+        await db.counters.update_one(
+            {"_id": f"invoice:{CLINIC_ID}:2026"},
+            {"$max": {"seq": inv_seq - 1}},
+            upsert=True,
+        )
     if fitting_docs:
         await db.ha_fittings.insert_many(fitting_docs)
     print(f"  ✓ HA sales: {len(sale_docs)} | Invoices: {len(invoice_docs)} | Fittings: {len(fitting_docs)}")
@@ -826,6 +836,13 @@ async def seed():
         inv_seq += 1
     if extra_invoices:
         await db.invoices.insert_many(extra_invoices)
+        # NAV-008 · Second seed batch — sync counter again to whichever
+        # is higher of (existing counter, inv_seq we just consumed).
+        await db.counters.update_one(
+            {"_id": f"invoice:{CLINIC_ID}:2026"},
+            {"$max": {"seq": inv_seq - 1}},
+            upsert=True,
+        )
     print(f"  ✓ Diagnostic invoices: {len(extra_invoices)}")
 
     # ---- 18. Referral partners + payouts -----------------------------------

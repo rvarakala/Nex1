@@ -121,9 +121,13 @@ def _new_order_no() -> str:
     return f"CHA/{year}/{uuid.uuid4().hex[:6].upper()}"
 
 
-def _new_invoice_no() -> str:
-    year = datetime.now(timezone.utc).year
-    return f"INV/{year}/{uuid.uuid4().hex[:6].upper()}"
+# NAV-008 · Custom-HA-order invoice numbering must go through the
+# canonical atomic counter. The previous local `_new_invoice_no()`
+# generator (INV/YYYY/{6-char-hex}) shared its regex namespace with
+# the counter's INV/YYYY/{6-digit-decimal} format and was the latent
+# collision risk documented in NAV008-INV-001. Import + retry-safe
+# insert helper live in `billing.py`.
+from billing import _next_invoice_no, _insert_invoice_with_retry  # noqa: E402
 
 
 def _build_line_desc(payload: CustomHAOrderCreate) -> str:
@@ -260,7 +264,7 @@ async def create_custom_ha_order(
     sgst = round(tax_total - cgst, 2)
 
     invoice_id = f"INV-{uuid.uuid4().hex[:10].upper()}"
-    invoice_no = _new_invoice_no()
+    invoice_no = await _next_invoice_no(db, user["clinic_id"])
     paid = round(float(payload.advance_amount), 2)
     balance = round(total - paid, 2)
     # Invoice model's `status` Literal only accepts draft/paid/partial/…
@@ -324,7 +328,10 @@ async def create_custom_ha_order(
         "created_at": now,
         "created_by_user_id": user["user_id"],
     }
-    await db.invoices.insert_one(invoice_doc)
+    await _insert_invoice_with_retry(db, invoice_doc, user["clinic_id"])
+    # If the retry loop renewed invoice_no, ensure downstream code
+    # (order back-link + response) sees the final canonical number.
+    invoice_no = invoice_doc["invoice_no"]
 
     # ── Order doc ──
     order_doc = {

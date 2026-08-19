@@ -688,8 +688,11 @@ async def generate_service_invoice(
         inv.status = "paid"
         inv.due_total = 0.0
 
-    from billing import _serialize
-    await db.invoices.insert_one(_serialize(inv.model_dump()))
+    from billing import _serialize, _insert_invoice_with_retry
+    inv_doc = _serialize(inv.model_dump())
+    await _insert_invoice_with_retry(db, inv_doc, user["clinic_id"])
+    if inv_doc.get("invoice_no") != inv.invoice_no:
+        inv.invoice_no = inv_doc["invoice_no"]
     # Stamp on ticket so future calls are idempotent
     await db.service_tickets.update_one(
         {"clinic_id": user["clinic_id"], "ticket_no": ticket_no},

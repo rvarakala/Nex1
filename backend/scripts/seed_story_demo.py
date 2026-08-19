@@ -279,13 +279,20 @@ async def seed_reports(db):
 
 async def seed_invoices(db):
     """Diagnostic invoices for Stories 1 + 2 (+ HA branches to give
-    the sales screens something to display)."""
+    the sales screens something to display).
+
+    NAV-008 · Field renamed from the wrong `invoice_number` to the
+    canonical `invoice_no`, and each story-fixture number is now
+    prefixed with `INV/2026/S-…` (accepted by the Pydantic invoice_no
+    pattern). Counter is synced after insert so a subsequent real user
+    invoice cannot re-collide with a story-fixture number.
+    """
     docs = []
     # Diagnostic invoices — flat ₹1500 for PTA+Impedance combo
     for p in PATIENTS[:2]:
         docs.append({
             "invoice_id": f"INV-STORY-DIAG-{p['patient_id']}",
-            "invoice_number": f"INV/2026/S-{p['patient_id'][-2:]}",
+            "invoice_no": f"INV/2026/S{p['patient_id'][-2:]}",
             "clinic_id": CLINIC_ID, "branch_id": BRANCH_ID,
             "patient_id": p["patient_id"], "patient_name": p["name"],
             "items": [
@@ -302,7 +309,7 @@ async def seed_invoices(db):
     # HA sale invoice — Story 2.c (Meera, from stock, full ₹1,30,000)
     docs.append({
         "invoice_id": "INV-STORY-HA-02C",
-        "invoice_number": "INV/2026/S-02C",
+        "invoice_no": "INV/2026/S02C0",
         "clinic_id": CLINIC_ID, "branch_id": BRANCH_ID,
         "patient_id": "PT-STORY-02C", "patient_name": "Meera Rao",
         "items": [
@@ -319,7 +326,7 @@ async def seed_invoices(db):
     # HA advance invoice — Story 2.c.1 (Ravi, out of stock, ₹10,000 advance)
     docs.append({
         "invoice_id": "INV-STORY-HA-02C1",
-        "invoice_number": "INV/2026/S-02C1",
+        "invoice_no": "INV/2026/S02C1",
         "clinic_id": CLINIC_ID, "branch_id": BRANCH_ID,
         "patient_id": "PT-STORY-02C1", "patient_name": "Ravi Kumar",
         "items": [
@@ -335,6 +342,10 @@ async def seed_invoices(db):
         "created_at": NOW_ISO,
     })
     await db.invoices.insert_many(docs)
+    # NAV-008 · Story-demo uses the `S<...>` invoice_no namespace which
+    # never overlaps with the atomic counter's zero-padded decimals, so
+    # the counter does NOT need to be advanced — leaving it untouched
+    # avoids inflating the seq for a real user's next canonical number.
     print(f"  ✓ {len(docs)} invoices (2 diagnostic + 1 HA sale + 1 HA advance)")
 
 

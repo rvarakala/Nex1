@@ -104,6 +104,36 @@ async def lifespan(_app: FastAPI):
         await db.invoices.create_index([("clinic_id", 1), ("invoice_date", -1)])
         await db.invoices.create_index([("clinic_id", 1), ("patient_id", 1)])
         await db.invoices.create_index("invoice_no")
+        # NAV-008 · Compound partial unique index on (clinic_id, invoice_no).
+        # `partialFilterExpression={"invoice_no": {"$type": "string"}}` skips
+        # legacy rows where invoice_no is missing/null (Preview has 2 such
+        # test-fixture docs). Wrapped in try/except so a Preview environment
+        # with a KNOWN existing duplicate does NOT crash startup — the loud
+        # error surfaces the blocking data condition without taking down
+        # the pod. Production is expected to have zero duplicates and the
+        # index will build cleanly.
+        try:
+            await db.invoices.create_index(
+                [("clinic_id", 1), ("invoice_no", 1)],
+                unique=True,
+                partialFilterExpression={"invoice_no": {"$type": "string"}},
+                name="clinic_id_1_invoice_no_1_unique",
+            )
+        except Exception as _idx_err:
+            _msg = str(_idx_err)
+            if "E11000" in _msg or "duplicate" in _msg.lower():
+                _log.error(
+                    "NAV-008 · Compound unique index (clinic_id, invoice_no) "
+                    "NOT installed — existing duplicate data detected: %s. "
+                    "New duplicates are NOT prevented until the duplicate row(s) "
+                    "are remediated. Run backend/scripts/nav008_counter_reconcile.py "
+                    "(counter sync only) and see docs for the separately-gated "
+                    "renumber path.",
+                    _msg,
+                )
+            else:
+                # Unrelated failure — re-raise to surface the real bug.
+                raise
         await db.payments.create_index("payment_id", unique=True)
         await db.payments.create_index([("clinic_id", 1), ("paid_at", -1)])
         await db.payments.create_index("invoice_id")

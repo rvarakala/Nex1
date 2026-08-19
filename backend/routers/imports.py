@@ -783,14 +783,43 @@ async def commit_patients(
                             "cgst_amount": 0.0, "sgst_amount": 0.0, "igst_amount": 0.0,
                             "line_total": per_test_price,
                         })
+                    # NAV-008 · Policy B — preserve supplied invoice_no
+                    # (from `bill_no` CSV column) OR mint an IMP/… canonical
+                    # placeholder. THEN check the compound uniqueness rule
+                    # BEFORE insertion. On collision we surface a controlled
+                    # per-row failure into `failure_details` — the operator
+                    # sees the offending row and can fix the source CSV. We
+                    # deliberately do NOT silently overwrite or silently
+                    # renumber historical imports; renumbering historical
+                    # data is a GST-affecting operation gated separately.
                     invoice_no = bill_no or f"IMP/{visit_date or datetime.utcnow().strftime('%Y-%m-%d')}/{str(uuid4())[:6].upper()}"
                     invoice_id = f"INV-{str(uuid4())[:10].upper()}"
                     payment_id = f"PAY-{str(uuid4())[:8].upper()}"
+                    # Duplicate check — if a same-clinic invoice already
+                    # exists with this number, reject THIS row and continue
+                    # with the next.
+                    _existing = await db.invoices.find_one(
+                        {"clinic_id": user["clinic_id"], "invoice_no": invoice_no},
+                        {"_id": 0, "invoice_id": 1},
+                    )
+                    if _existing:
+                        failed += 1
+                        failure_details.append({
+                            "row": r.get("name"),
+                            "error": (
+                                f"Invoice number {invoice_no!r} already exists in this clinic "
+                                f"(existing invoice_id={_existing.get('invoice_id')!r}). "
+                                f"NAV-008 Policy B: historical imports are never silently "
+                                f"renumbered; please deduplicate the source CSV or omit the "
+                                f"bill_no column to receive an auto-generated IMP/… number."
+                            ),
+                        })
+                        continue
                     inv_doc = {
                         "invoice_id": invoice_id,
                         "clinic_id": user["clinic_id"],
                         "invoice_no": invoice_no,
-                        "external_invoice_no": bill_no,            # original clinic bill #
+                        "external_invoice_no": bill_no,            # original clinic bill # (audit trail)
                         "patient_id": patient_id,
                         "patient_name": patient_name,
                         "patient_mobile": r.get("mobile"),
@@ -819,7 +848,25 @@ async def commit_patients(
                         "created_by_user_id": user["user_id"],
                         "imported_via": import_id,
                     }
-                    await db.invoices.insert_one(serialize_datetime(dict(inv_doc)))
+                    try:
+                        await db.invoices.insert_one(serialize_datetime(dict(inv_doc)))
+                    except Exception as _dup:
+                        # If the compound unique index rejected this row
+                        # despite our pre-check (rare race), surface it
+                        # as a per-row failure rather than aborting the
+                        # whole import.
+                        if "E11000" in str(_dup) or "duplicate" in str(_dup).lower():
+                            failed += 1
+                            failure_details.append({
+                                "row": r.get("name"),
+                                "error": (
+                                    f"Invoice number {invoice_no!r} collided at insert "
+                                    f"time (concurrent race). Row skipped. Retry the "
+                                    f"import for this row to receive a fresh IMP/… number."
+                                ),
+                            })
+                            continue
+                        raise
                     # Also write a top-level payment row so revenue aggregation picks it up.
                     await db.payments.insert_one(serialize_datetime({
                         "payment_id": payment_id,

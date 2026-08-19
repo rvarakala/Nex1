@@ -641,7 +641,14 @@ async def create_quick_sale(
             "received_by_user_id": user["user_id"],
             "notes": "Initial payment captured via HA Quick Sale.",
         }]
-    await db.invoices.insert_one(invoice_doc)
+    # NAV-008 · Route through the retry-safe insert helper so a
+    # concurrent counter collision (extremely rare, only possible if
+    # a raw insert bypassed the counter) transparently renews the
+    # invoice_no. On persistent conflict the helper raises a
+    # controlled 500 instead of leaking a Mongo E11000.
+    from billing import _insert_invoice_with_retry
+    await _insert_invoice_with_retry(db, invoice_doc, user["clinic_id"])
+    invoice_no = invoice_doc["invoice_no"]
 
     log.info(
         f"quick-sale created clinic={user['clinic_id']} sale_no={sale_no} "

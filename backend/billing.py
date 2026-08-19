@@ -88,6 +88,84 @@ async def _next_invoice_no(db, clinic_id: str) -> str:
     return f"INV/{year}/{str(seq).zfill(6)}"
 
 
+# ──────────────────────────────────────────────────────────────────────
+# NAV-008 · Duplicate-key retry safeguard
+# ──────────────────────────────────────────────────────────────────────
+# The compound unique index `clinic_id_1_invoice_no_1_unique` (installed
+# by server.py startup, gated by the absence of existing duplicates)
+# enforces that no two invoices in the same clinic can share the same
+# invoice_no. Under the atomic counter this SHOULD be impossible — but
+# a defence-in-depth wrapper handles the pathological edge case where a
+# raw insert (from another process, a manual DB write, or a bug in a
+# future writer) has occupied the number the counter is about to hand
+# out. In that case we transparently pull the NEXT counter value and
+# retry, up to 3 attempts total.
+#
+# The wrapper ONLY retries when the DuplicateKeyError originates from
+# the invoice-uniqueness index; unrelated duplicate errors (e.g. a
+# concurrent identical invoice_id) are re-raised unchanged.
+_INVOICE_UNIQUE_INDEX_NAME = "clinic_id_1_invoice_no_1_unique"
+
+
+async def _insert_invoice_with_retry(db, inv_doc: dict, clinic_id: str, max_attempts: int = 3) -> dict:
+    """Insert an invoice document with automatic retry on (clinic_id,
+    invoice_no) uniqueness violation.
+
+    Args:
+        db          : Motor DB handle.
+        inv_doc     : the fully-serialised invoice document ready for
+                      insert. MUST already contain `invoice_no` (set by
+                      the caller via `_next_invoice_no`).
+        clinic_id   : caller's clinic_id for counter renewal on retry.
+        max_attempts: total insert attempts (default 3).
+
+    Returns the (possibly updated) inv_doc on success. Raises
+    HTTPException 500 on repeated conflict, letting the caller surface
+    a controlled application-level error instead of an unhandled 500.
+
+    Behaviour by MongoDB error:
+    - E11000 on `clinic_id_1_invoice_no_1_unique` → renew invoice_no
+      from counter, retry.
+    - E11000 on any other index (e.g. invoice_id) → NOT retried;
+      re-raised so the caller can decide what to do.
+    - Non-duplicate errors → re-raised unchanged.
+    """
+    from pymongo.errors import DuplicateKeyError
+    for attempt in range(1, max_attempts + 1):
+        try:
+            await db.invoices.insert_one(inv_doc)
+            return inv_doc
+        except DuplicateKeyError as e:
+            # Only retry when the conflict is on the invoice-uniqueness
+            # index we installed for NAV-008. Any other collision (e.g.
+            # invoice_id which is separately unique) is a genuinely
+            # different bug — surface it as-is.
+            err_text = str(e)
+            if _INVOICE_UNIQUE_INDEX_NAME not in err_text and "invoice_no" not in err_text:
+                raise
+            if attempt == max_attempts:
+                logging.getLogger(__name__).error(
+                    f"NAV-008 · Invoice-number conflict persisted after {max_attempts} attempts "
+                    f"for clinic {clinic_id!r}; giving up. Last attempted invoice_no="
+                    f"{inv_doc.get('invoice_no')!r}. Raw error: {err_text}"
+                )
+                raise HTTPException(
+                    status_code=500,
+                    detail="Invoice-number conflict; please retry the request.",
+                )
+            # Renew the number and try again.
+            inv_doc["invoice_no"] = await _next_invoice_no(db, clinic_id)
+            # Also renew embedded MongoDB _id if the driver stamped one
+            # onto the failed insert (Motor mutates the doc on insert).
+            inv_doc.pop("_id", None)
+            logging.getLogger(__name__).info(
+                f"NAV-008 · Invoice-no conflict on attempt {attempt} for clinic {clinic_id!r}; "
+                f"retrying with fresh number {inv_doc['invoice_no']!r}."
+            )
+    # Unreachable — either return or raise inside the loop.
+    raise HTTPException(status_code=500, detail="Invoice insert failed unexpectedly.")
+
+
 def _compute_line(line_in: InvoiceLineCreate, service: Optional[dict]) -> InvoiceLine:
     """Resolve a line-create request against optional service and compute taxes."""
     name = line_in.description or (service.get("name") if service else None)
@@ -367,7 +445,11 @@ async def create_invoice(payload: InvoiceCreate,
 
     _sum_invoice(inv)
 
-    await db.invoices.insert_one(_serialize(inv.model_dump()))
+    inv_serialized = _serialize(inv.model_dump())
+    inv_serialized = await _insert_invoice_with_retry(db, inv_serialized, clinic_id)
+    # If the retry loop renewed invoice_no, keep the response in sync.
+    if inv_serialized.get("invoice_no") != inv.invoice_no:
+        inv.invoice_no = inv_serialized["invoice_no"]
 
     # If created from an HA sale, write the back-link into ha_sales so the
     # auto-flip on payment can find the sale by invoice_no.

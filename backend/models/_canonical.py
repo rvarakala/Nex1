@@ -464,7 +464,19 @@ class Invoice(BaseModel):
     model_config = ConfigDict(extra="ignore")
     invoice_id: str = Field(default_factory=lambda: f"INV-{str(uuid4())[:10].upper()}")
     clinic_id: str
-    invoice_no: str                                              # Human-facing, e.g. "INV/2026/000123"
+    # NAV-008 · Human-facing invoice number. Canonical newly-generated
+    # format is `INV/{YYYY}/{6-digit decimal}` produced by
+    # `billing._next_invoice_no`. The regex accepts:
+    #   · canonical decimal — `INV/2026/000042`
+    #   · legacy 6-char hex — `INV/2026/0669C8`  (historical writers)
+    #   · CSV-imported `IMP/…` prefix — see `imports.py`
+    # Empty string / None is explicitly rejected — a defensive layer
+    # that catches raw-insert bugs BEFORE they reach the DB uniqueness
+    # index. Test fixtures / historical rows that lack `invoice_no`
+    # continue to load via `find_one` because Pydantic runs on the
+    # WRITE path only, not the read-back path (billing._deserialize
+    # tolerates the absence).
+    invoice_no: str = Field(pattern=r"^(INV|IMP)/\d{4}/[0-9A-Za-z\-]{4,32}$")   # Human-facing, e.g. "INV/2026/000123"
 
     patient_id: str
     patient_name: str
