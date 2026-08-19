@@ -1,6 +1,65 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-007 — FORMALLY CLOSED (2026-08-19)
+
+**Status**: CLOSED · signed off by user after production public-surface verification.
+
+**Sprint**: Multi-Branch / Login-as-Branch Deactivation & Access Hardening.
+
+**Deployed (7 approved fixes)**:
+- **B1** · Central `get_current_user` inactive/suspended-clinic auth gate with legacy tolerance (missing/null status still PASS — critical for 14/23 pre-status preview rows). Break-glass env var `MULTI_BRANCH_INACTIVE_ENFORCEMENT_DISABLED` (default OFF, loud error log if ever enabled).
+- **B2** · `_revoke_head_admins_access` widened to pull the deactivated branch from EVERY user's `additional_clinic_ids` platform-wide (was head-admin-only).
+- **B3** · Surgical `user_sessions` revocation with `revoke_reason="branch_deactivated"`. **NO `token_version` bump** — preserves multi-clinic users' unrelated active-clinic sessions.
+- **B4** · `/auth/my-clinics` filters clinics with `status ∈ {inactive, suspended}`; projection swapped from phantom `active` field to real `status` field.
+- **B5** · `/auth/switch-clinic` returns 403 when the target clinic is inactive or suspended (before minting a JWT or writing to `clinic_switch_audit`).
+- **G1** · New `POST /api/clinic-groups/mine/branches/{id}/reactivate` endpoint. Never touches `user.active`, never rolls back `token_version`, never resurrects manually-deactivated users. Idempotent. Foreign-branch → 404. Non-head-admin `additional_clinic_ids` grants are NOT auto-restored (documented design decision — must be re-linked via `/auth/link-clinic`).
+- **B6** · Phantom `clinics.active` field retired from `/auth/my-clinics` projection and `admin_panel_b.py` CSV export (which now derives `clinic_active` from `status`).
+
+**Deferred / WON'T FIX in this sprint** (approved as P3 backlog, not blocking closure):
+- R1 · Unique index on `clinic_groups.head_clinic_id` — deferred pending production duplicate probe.
+- G2 · Head-owner audit endpoint.
+- R4 · Auth-event log for inactive-clinic rejections.
+
+**Files changed (4 runtime + 1 new test file)**:
+- `backend/auth.py` — +70 / -0 (B1 gate + kill switch).
+- `backend/routers/clinic_groups.py` — +143 / -25 (B2 widen + B3 session revoke + G1 reactivate endpoint + `_INACTIVE_STATUSES` local constant).
+- `backend/server.py` — +32 / -9 (B4 filter + B5 403 + `status` projection).
+- `backend/routers/admin_panel_b.py` — +10 / -3 (B6 CSV `clinic_active` derived from `status`).
+- `backend/tests/test_nav007_multi_branch_hardening.py` — **NEW** 855-line 22-test regression suite covering all 7 fixes plus the multi-clinic-isolation invariant (Head + Branch A + Branch B → deactivate A → A dies, Head + B still work, switch into A → 403, switch into B → 200).
+
+**Test evidence at closure**:
+- New NAV-007 suite: **22 / 22 PASS**.
+- NAV-006 regression: **64 / 64 PASS**.
+- NAV-005 regression: **47 / 47 PASS**.
+- Combined single-invocation gate: **133 / 133 PASS** (95.87 s).
+- Ruff on all 5 touched files: **0 findings**.
+
+**Deviations from approved plan (both security-tightening, none scope-expanding)**:
+1. `token_version` bump removed entirely from `deactivate_branch` — the central B1 gate plus surgical `user_sessions` revocation is sufficient to lock branch access, without the collateral risk of forcibly logging multi-clinic users out of their unrelated active-clinic sessions. Documented in the `deactivate_branch` docstring; verified by tests #13 + #22.
+2. Local `_INACTIVE_STATUSES = {"inactive", "suspended"}` constant added to `clinic_groups.py` as a mirror of `auth.py::_INACTIVE_CLINIC_STATUSES` to avoid a circular import back into the auth module. Inline comment flags the coupling.
+
+**Production public-surface verification (unauthenticated / read-only)**:
+- `GET /api/health` → 200 healthy.
+- `GET /` (SPA) → 200 · 3703 bytes.
+- `GET /api/auth/me` → 401.
+- `POST /api/clinic-groups/mine/branches/<dummy>/deactivate` → 401.
+- `POST /api/clinic-groups/mine/branches/<dummy>/reactivate` → **401 · CRITICAL POSITIVE SIGNAL** (was 404 pre-deploy — confirms the new NAV-007 route is registered on production).
+- `GET /api/auth/my-clinics` → 401.
+- `POST /api/auth/switch-clinic` → 401.
+- NAV-006 regression routes (`/diagnostics/queue`, `/diagnostics/queue/start`, `/sessions`, `/reports/{sid}/pdf`, `/hearing-reports/save`) → all 401 (auth gate intact).
+
+**Production data / burner safety**:
+- Zero production writes. Zero authenticated production probes. Zero production test users created. Zero clinical data modified or deleted. Deleted burner account never used or recreated. `/app/memory/test_credentials.md` remains absent.
+- Deployment done using "Keep existing database" — existing production DB retained per Emergent Support confirmation.
+
+**Behavioural correctness evidence**: the **NAV-005 + NAV-006 + NAV-007 · 133/133 preview regression suite**. NAV-007 clinical / data-plane behaviour is NOT claimed to have been production-tested — the production verification is strictly unauthenticated / read-only public-surface routing.
+
+**No further NAV-007 work planned. Referral Payouts, Vestibular, WhatsApp/MSG91, and all other sprints remain NOT STARTED. Standing by for explicit next instruction.**
+
+
+
+
 ## 🏁 NAV-006 — FORMALLY CLOSED (2026-08-18)
 
 **Status**: CLOSED · signed off by user after F-008 production verification.
