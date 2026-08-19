@@ -29,7 +29,7 @@ from bson import ObjectId
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, Query, Response
 from motor.motor_asyncio import AsyncIOMotorGridFSBucket
 
-from auth import get_current_user
+from auth import get_current_user, require_roles
 from database import get_db
 from models_transfers import (
     StockTransfer, StockTransferCreate, StockTransferDispatch,
@@ -105,7 +105,8 @@ def _strip(t: dict) -> dict:
 # ============================================================================
 @router.post("", response_model=StockTransfer)
 async def create_transfer(payload: StockTransferCreate,
-                          user=Depends(get_current_user), db=Depends(get_db)):
+                          user=Depends(require_roles("inventory_manager", "clinic_owner")),
+                          db=Depends(get_db)):
     if not payload.serial_ids and not payload.accessory_lines:
         raise HTTPException(status_code=400, detail="Add at least one serial or accessory line")
 
@@ -172,7 +173,8 @@ async def create_transfer(payload: StockTransferCreate,
 # ============================================================================
 @router.post("/{transfer_id}/dispatch", response_model=StockTransfer)
 async def dispatch_transfer(transfer_id: str, payload: StockTransferDispatch,
-                            user=Depends(get_current_user), db=Depends(get_db)):
+                            user=Depends(require_roles("inventory_manager", "clinic_owner")),
+                            db=Depends(get_db)):
     t = await db.stock_transfers.find_one({"transfer_id": transfer_id}, {"_id": 0})
     if not t:
         raise HTTPException(status_code=404, detail="Transfer not found")
@@ -255,7 +257,8 @@ async def dispatch_transfer(transfer_id: str, payload: StockTransferDispatch,
 # ============================================================================
 @router.post("/{transfer_id}/receive", response_model=StockTransfer)
 async def receive_transfer(transfer_id: str, payload: StockTransferReceive,
-                           user=Depends(get_current_user), db=Depends(get_db)):
+                           user=Depends(require_roles("inventory_manager", "clinic_owner", "front_desk")),
+                           db=Depends(get_db)):
     t = await db.stock_transfers.find_one({"transfer_id": transfer_id}, {"_id": 0})
     if not t:
         raise HTTPException(status_code=404, detail="Transfer not found")

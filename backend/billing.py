@@ -836,6 +836,36 @@ async def create_invoice(payload: InvoiceCreate,
 
     _sum_invoice(inv)
 
+    # NAV-010 · INV-003 + INV-007 · Atomically reserve (decrement)
+    # accessory stock BEFORE persisting the invoice. If any accessory
+    # line is short, all prior successful decrements are compensated
+    # and this endpoint returns HTTP 409 — no invoice, no payment
+    # side-effect, no stock change. Lines that succeed are marked
+    # ``accessory_stock_decremented=True`` so the paid-transition
+    # helper skips them and no double-decrement can happen.
+    from utils.accessory_stock import reserve_accessory_stock_atomic
+    try:
+        reserved = await reserve_accessory_stock_atomic(
+            db,
+            clinic_id=clinic_id,
+            branch_id=user.get("branch_id"),
+            lines=[ln.model_dump() for ln in inv.lines],
+            actor_user_id=user["user_id"],
+        )
+    except HTTPException:
+        # Reservation guarantees compensating rollback of accessory
+        # decrements. Also unwind the initial-payment top-level row
+        # (if any) so no orphan lingers in ``db.payments``.
+        if payload.initial_payment and payload.initial_payment.amount > 0 and inv.payments:
+            await db.payments.delete_one({"payment_id": inv.payments[0].payment_id})
+        raise
+    # Mark successfully-reserved lines so the paid-transition helper
+    # will skip them (avoids double-decrement on legacy flow).
+    for r in reserved:
+        idx = r["line_index"]
+        if 0 <= idx < len(inv.lines):
+            inv.lines[idx].accessory_stock_decremented = True
+
     inv_serialized = _serialize(inv.model_dump())
     inv_serialized = await _insert_invoice_with_retry(db, inv_serialized, clinic_id)
     # If the retry loop renewed invoice_no, keep the response in sync.
@@ -1250,6 +1280,46 @@ async def cancel_invoice(invoice_id: str, payload: dict,
         raise HTTPException(status_code=404, detail="Invoice not found")
     if inv.get("status") == "cancelled":
         raise HTTPException(status_code=400, detail="Already cancelled")
+
+    # NAV-010 · INV-006 · HARD BLOCK generic invoice cancellation when
+    # the invoice has any inventory footprint. Historical footprint is
+    # sufficient — do NOT introspect current physical state (e.g. a
+    # manually-flipped SOLD → IN_STOCK serial). The operator must use
+    # the appropriate controlled-inventory cancellation workflow
+    # (e.g. `POST /api/ha/quick-sales/{id}/cancel`) so the state
+    # machine, accessory stock, and offline-refund audit rows all
+    # move together.
+    if inv.get("source") == "ha_quick_sale" or inv.get("ha_quick_sale_id"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This invoice is linked to a Quick Sale — cancel via "
+                "POST /api/ha/quick-sales/{quick_sale_id}/cancel so serial "
+                "state, accessory stock and refund audit rows all move "
+                "together."
+            ),
+        )
+    if inv.get("linked_sale_no"):
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This invoice is linked to HA sale {inv['linked_sale_no']} — "
+                f"cancel via POST /api/ha/sales/{{sale_no}}/cancel to reverse "
+                f"serial reservations, then this invoice may be cancelled."
+            ),
+        )
+    for ln in (inv.get("lines") or []):
+        if ln.get("accessory_stock_decremented"):
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This invoice decremented accessory stock. Cancelling "
+                    "here would silently orphan the reservation. Use the "
+                    "controlled inventory cancellation workflow to restore "
+                    "stock atomically."
+                ),
+            )
+
     reason = (payload or {}).get("reason") or "Cancelled"
     await db.invoices.update_one(
         {"invoice_id": invoice_id},

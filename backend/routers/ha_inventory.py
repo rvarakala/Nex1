@@ -12,6 +12,7 @@ from typing import List, Optional
 
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
+from pymongo import ReturnDocument
 
 from auth import (
     get_current_user, require_roles, user_can_see_branch,
@@ -1167,29 +1168,61 @@ async def adjust_accessory_stock(
     db=Depends(get_db),
 ):
     """Manual qty adjust. Writes to `accessory_events` for audit.
-    Rejects if delta would drive qty below zero."""
+
+    NAV-010 · INV-004 · Uses atomic ``$inc`` with a stock-sufficiency
+    guard on negative deltas so two concurrent adjustments cannot
+    lost-update each other and no adjustment can drive qty below zero.
+    """
     sku = await db.accessory_stock.find_one(
-        {"sku_id": sku_id, "clinic_id": user["clinic_id"]}, {"_id": 0},
+        {"sku_id": sku_id, "clinic_id": user["clinic_id"]},
+        {"_id": 0, "branch_id": 1, "qty_on_hand": 1},
     )
     if not sku:
         raise HTTPException(status_code=404, detail="Accessory SKU not found")
     if not user_can_see_branch(user, sku["branch_id"]):
         raise HTTPException(status_code=403, detail="Branch access denied")
-    new_qty = int(sku.get("qty_on_hand", 0)) + int(payload.delta)
-    if new_qty < 0:
-        raise HTTPException(status_code=409, detail="Adjustment would drive qty below zero")
+
+    delta = int(payload.delta)
     now = datetime.now(timezone.utc).isoformat()
-    await db.accessory_stock.update_one(
-        {"sku_id": sku_id},
-        {"$set": {"qty_on_hand": new_qty, "updated_at": now}},
+    match: dict = {"sku_id": sku_id, "clinic_id": user["clinic_id"]}
+    if delta < 0:
+        # Only apply the decrement if stock is at least |delta|. The
+        # ``$expr`` shape keeps this a single atomic operation.
+        match["qty_on_hand"] = {"$gte": -delta}
+
+    result = await db.accessory_stock.find_one_and_update(
+        match,
+        {"$inc": {"qty_on_hand": delta},
+         "$set": {"updated_at": now}},
+        projection={"_id": 0, "qty_on_hand": 1},
+        return_document=ReturnDocument.AFTER,
     )
+    if result is None:
+        # Only reachable for negative deltas where the guard failed.
+        fresh = await db.accessory_stock.find_one(
+            {"sku_id": sku_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0, "qty_on_hand": 1},
+        )
+        current = int((fresh or {}).get("qty_on_hand", 0))
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Adjustment would drive qty below zero "
+                f"(current: {current}, delta: {delta})"
+            ),
+        )
+
+    new_qty = int(result["qty_on_hand"])
+    before = new_qty - delta
     await db.accessory_events.insert_one({
         "sku_id": sku_id,
-        "delta": payload.delta,
+        "clinic_id": user["clinic_id"],
+        "branch_id": sku["branch_id"],
+        "delta": delta,
         "reason": payload.reason,
         "at": now,
         "actor_user_id": user["user_id"],
-        "before": sku.get("qty_on_hand", 0),
+        "before": before,
         "after": new_qty,
     })
     return {"sku_id": sku_id, "qty_on_hand": new_qty}

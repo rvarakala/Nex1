@@ -336,6 +336,10 @@ class TestAutoDecrement:
             f"stock re-decremented! now {row['qty_on_hand']}, expected 20 (r={r.status_code})"
 
     def test_partial_to_paid_transition(self, owner_token, patient_id, dome_product):
+        # NAV-010 · INV-003 · accessory stock is now reserved (decremented)
+        # atomically at invoice-creation time rather than on the paid
+        # transition. This test now verifies the immediate-decrement
+        # semantics and the idempotency guard against re-decrement.
         product = dome_product["product"]
         # set L variant to 15
         row = _get_stock_row(owner_token, product["product_id"], "L")
@@ -360,11 +364,12 @@ class TestAutoDecrement:
         invoice_id = inv["invoice_id"]
         assert inv["status"] in ("draft", "unpaid", "partial"), inv["status"]
 
-        # Stock unchanged (still 15)
+        # NAV-010 · INV-003: stock has already been reserved on create.
         row2 = _get_stock_row(owner_token, product["product_id"], "L")
-        assert row2["qty_on_hand"] == 15
+        assert row2["qty_on_hand"] == 10, \
+            f"expected 10 (immediate reservation on create), got {row2['qty_on_hand']}"
 
-        # Partial payment
+        # Partial payment — no additional decrement (INV-003 idempotency).
         r_p1 = requests.post(f"{API}/billing/invoices/{invoice_id}/payments",
                              headers=H(owner_token),
                              json={"method": "cash", "amount": 100.0},
@@ -372,9 +377,9 @@ class TestAutoDecrement:
         assert r_p1.status_code in (200, 201), r_p1.text[:200]
         assert r_p1.json()["status"] == "partial"
         row3 = _get_stock_row(owner_token, product["product_id"], "L")
-        assert row3["qty_on_hand"] == 15, "stock decremented on partial!"
+        assert row3["qty_on_hand"] == 10, "stock re-decremented on partial!"
 
-        # Full settlement
+        # Full settlement — still no additional decrement.
         r_p2 = requests.post(f"{API}/billing/invoices/{invoice_id}/payments",
                              headers=H(owner_token),
                              json={"method": "cash", "amount": 400.0},
@@ -384,7 +389,7 @@ class TestAutoDecrement:
         time.sleep(0.5)
         row4 = _get_stock_row(owner_token, product["product_id"], "L")
         assert row4["qty_on_hand"] == 10, \
-            f"expected 10 after paid transition, got {row4['qty_on_hand']}"
+            f"expected 10 (no re-decrement on paid), got {row4['qty_on_hand']}"
 
     def test_non_accessory_invoice_no_side_effects(self, owner_token, patient_id, dome_product):
         product = dome_product["product"]
@@ -407,11 +412,17 @@ class TestAutoDecrement:
         row_after = _get_stock_row(owner_token, product["product_id"], "S")
         assert int(row_after["qty_on_hand"]) == qty_before
 
-    def test_shortfall_floors_to_zero(self, owner_token, patient_id, dome_product):
+    def test_shortfall_returns_409_no_side_effects(self, owner_token, patient_id, dome_product):
+        # NAV-010 · INV-007 · shortage now returns HTTP 409 at invoice
+        # creation time with zero side-effects (no invoice, no payment,
+        # no stock mutation). Previously the code silently floored to
+        # zero — that behaviour has been retired.
         product = dome_product["product"]
         row = _get_stock_row(owner_token, product["product_id"], "Power")
         # Set Power to 2
         _adjust_stock(owner_token, row["sku_id"], 2 - int(row["qty_on_hand"]))
+        qty_before = _get_stock_row(owner_token, product["product_id"], "Power")["qty_on_hand"]
+        assert qty_before == 2
         payload = {
             "patient_id": patient_id,
             "lines": [{
@@ -426,12 +437,12 @@ class TestAutoDecrement:
         }
         r = requests.post(f"{API}/billing/invoices", headers=H(owner_token),
                           json=payload, timeout=30)
-        assert r.status_code in (200, 201), r.text[:400]
-        assert r.json()["status"] == "paid"
-        time.sleep(0.5)
+        assert r.status_code == 409, r.text[:400]
+        assert "insufficient" in r.text.lower() or "stock" in r.text.lower()
+        # No mutation.
         row_after = _get_stock_row(owner_token, product["product_id"], "Power")
-        assert row_after["qty_on_hand"] == 0, \
-            f"expected 0 (floored), got {row_after['qty_on_hand']}"
+        assert row_after["qty_on_hand"] == 2, \
+            f"expected qty unchanged at 2, got {row_after['qty_on_hand']}"
 
     def test_ambiguous_brand_model_skips_gracefully(self, owner_token, patient_id):
         """Two accessory products with same brand+model → auto-decrement skips."""

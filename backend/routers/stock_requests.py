@@ -160,7 +160,7 @@ def _strip(row: dict) -> dict:
 @router.post("")
 async def create_request(
     payload: CreateRequestPayload,
-    user=Depends(get_current_user),
+    user=Depends(require_roles("front_desk", "accounts", "clinic_owner", "inventory_manager")),
     db=Depends(get_db),
 ):
     """Branch (or head) raises a request. Head clinic requests are

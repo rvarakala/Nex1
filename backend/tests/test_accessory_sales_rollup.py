@@ -232,6 +232,37 @@ class TestInvoiceLineAccessoryFields:
         prod = self._first_accessory_product(owner_token)
         assert prod, "no accessory products in tenant"
         variant = (prod.get("variant_labels") or [None])[0]
+
+        # NAV-010 · INV-003 · accessory stock is now reserved at invoice
+        # creation. Ensure the picked (product, variant) row has qty ≥ 1
+        # before submitting so this test — which validates that the new
+        # `accessory_product_id` / `accessory_variant` picker fields
+        # persist on the invoice line — is not blocked by a stray
+        # zero-stock demo SKU.
+        try:
+            hydrated = requests.get(
+                f"{API}/ha/accessory-stock-hydrated",
+                headers=H(owner_token),
+                params={"branch_id": BRANCH_ID},
+                timeout=15,
+            ).json()
+            items = hydrated.get("items") or []
+            match = next(
+                (r for r in items
+                 if r.get("product_id") == prod["product_id"]
+                 and (r.get("variant") == variant or (r.get("variant") is None and variant is None))),
+                None,
+            )
+            if match and int(match.get("qty_on_hand") or 0) < 1:
+                requests.post(
+                    f"{API}/ha/accessory-stock/{match['sku_id']}/adjust",
+                    headers=H(owner_token),
+                    json={"delta": 5, "reason": "NAV-010 test seed"},
+                    timeout=10,
+                )
+        except Exception:  # noqa: BLE001 — best-effort seed
+            pass
+
         payload = {
             "patient_id": patient_id,
             "lines": [{
@@ -258,8 +289,9 @@ class TestInvoiceLineAccessoryFields:
         line = r_g.json()["lines"][0]
         assert line["accessory_product_id"] == prod["product_id"]
         assert line.get("accessory_variant") == variant
-        # Not paid yet → not decremented
-        assert line.get("accessory_stock_decremented") in (False, None)
+        # NAV-010 · INV-003: stock is reserved on create → decremented
+        # flag is now True on the persisted line.
+        assert line.get("accessory_stock_decremented") is True
 
     def test_regression_hearing_aid_line_no_picker_fields(self, owner_token, patient_id):
         """Backwards-compat: non-Accessory line (HA / service) still creates fine

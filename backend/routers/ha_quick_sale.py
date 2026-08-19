@@ -35,9 +35,12 @@ from typing import List, Literal, Optional
 from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 
+from pymongo import ReturnDocument
+
 from auth import get_current_user, require_roles, user_can_see_branch
 from billing import _next_invoice_no
 from database import get_db
+from utils.accessory_stock import restore_accessory_stock
 from utils.ha_states import transition_serial
 from utils.numbering import next_number
 
@@ -1045,4 +1048,433 @@ async def sync_inventory(
         created_serial_ids=new_created,
         skipped=skipped,
         inventory_tracked=inv_tracked,
+    )
+
+
+# ─── NAV-010 · INV-005 · Quick Sale Cancellation ─────────────────────
+#
+# Design (approved by product, per NAV-010 Phase 2A authorisation):
+#   Two-phase state-machine cancellation guaranteeing zero partial mutation.
+#
+#     Phase A — LOCK
+#       CAS-flip `cancellation_state` on `ha_quick_sales` from unset → "cancelling".
+#       Any concurrent second caller loses this CAS and gets HTTP 409.
+#
+#     Phase B — PRE-FLIGHT (READ-ONLY)
+#       Verify every consumed serial is still SOLD (so `SOLD → RETURNED`
+#       is legal per `ALLOWED_TRANSITIONS`), the linked invoice exists,
+#       is not already cancelled, has no existing system-recorded refund
+#       row, and the caller has confirmed offline refund handling when
+#       there is a positive `paid_total`.
+#
+#       If ANY pre-flight check fails → rollback the LOCK (clear
+#       `cancellation_state`) and raise HTTP 409. Zero mutation.
+#
+#     Phase C — COMMIT (ORDERED)
+#       1. Serial reversal — `SOLD → RETURNED` per serial. Each hop is
+#          CAS-guarded via `transition_serial` (INV-001). If any hop
+#          fails, we HALT and leave `cancellation_state="cancelling"`
+#          so an operator can reconcile deterministically. The already-
+#          reverted serials remain in RETURNED; no invoice / audit
+#          state is touched, and no partial refund row is emitted.
+#       2. Accessory reversal — `restore_accessory_stock` compensates
+#          every accessory_stock_decremented=True line.
+#       3. Offline refund audit — ONE `payment_reversals` row PER
+#          embedded payment (kind ∈ {payment, None}), preserving the
+#          `original_payment_id`. Original payment rows are NEVER
+#          modified.
+#       4. Invoice — mark `cancelled`, `due_total=0`. `paid_total` and
+#          `refunded_total` are NOT touched (historical audit).
+#       5. Quick sale + fitting — `status="cancelled"`,
+#          `cancellation_state="cancelled"`, denormalised reasons.
+#
+# The `payment_reversals` collection is created on first write.
+
+class CancelQuickSaleIn(BaseModel):
+    """Payload for cancelling a Quick Sale via the controlled
+    cancellation workflow. Requires an explicit refund-handling
+    acknowledgement when any payment exists on the sale."""
+
+    reason: str = Field(..., min_length=1, max_length=500)
+    confirm_refund_offline: bool = Field(
+        False,
+        description=(
+            "Required to be True when the sale has any collected payment. "
+            "Confirms that the operator has (or will) reverse the money "
+            "outside the system — this endpoint does NOT invoke Razorpay "
+            "or any other integrated refund flow."
+        ),
+    )
+    notes: Optional[str] = Field(None, max_length=1000)
+
+
+class CancelQuickSaleOut(BaseModel):
+    quick_sale_id: str
+    invoice_id: str
+    invoice_no: str
+    status: str
+    cancellation_state: str
+    serials_reverted: List[str] = Field(default_factory=list)
+    accessory_lines_restored: int = 0
+    payment_reversal_ids: List[str] = Field(default_factory=list)
+    total: float
+    paid_total: float
+    refunded_total: float
+
+
+@router.post("/quick-sales/{quick_sale_id}/cancel", response_model=CancelQuickSaleOut)
+async def cancel_quick_sale(
+    quick_sale_id: str,
+    payload: CancelQuickSaleIn,
+    user=Depends(require_roles("clinic_owner")),
+    db=Depends(get_db),
+):
+    """Cancel a Quick Sale with atomic multi-collection state reversal.
+
+    See the design block above this function for the full two-phase
+    state-machine contract. This endpoint is deliberately tight on
+    RBAC (`clinic_owner` + `super_admin` + `founder`) because it can
+    move serials, invoice state, accessory stock, and record offline
+    refund audit rows in a single call.
+    """
+    clinic_id = user["clinic_id"]
+    now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
+
+    # ── Phase A · LOCK ─────────────────────────────────────────────
+    # CAS flip cancellation_state → cancelling. Concurrent callers lose.
+    qs = await db.ha_quick_sales.find_one_and_update(
+        {
+            "quick_sale_id": quick_sale_id,
+            "clinic_id": clinic_id,
+            # Only accept sales that are NOT already being cancelled and
+            # NOT already cancelled. Matches both missing field and null.
+            "$or": [
+                {"cancellation_state": {"$exists": False}},
+                {"cancellation_state": None},
+            ],
+        },
+        {"$set": {
+            "cancellation_state": "cancelling",
+            "cancelling_at": now_iso,
+            "cancelling_by": user["user_id"],
+        }},
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not qs:
+        # Diagnose: exists but in wrong state, or missing outright.
+        existing = await db.ha_quick_sales.find_one(
+            {"quick_sale_id": quick_sale_id, "clinic_id": clinic_id},
+            {"_id": 0, "cancellation_state": 1, "status": 1},
+        )
+        if not existing:
+            raise HTTPException(status_code=404, detail="Quick Sale not found")
+        state = existing.get("cancellation_state")
+        if state == "cancelled":
+            raise HTTPException(status_code=409, detail="Quick Sale is already cancelled")
+        if state == "cancelling":
+            raise HTTPException(
+                status_code=409,
+                detail="Quick Sale cancellation is already in progress",
+            )
+        raise HTTPException(
+            status_code=409,
+            detail=f"Quick Sale is in state {state!r} and cannot be cancelled",
+        )
+
+    # Local rollback helper used only by pre-flight failures.
+    async def _release_lock(rollback_reason: str) -> None:
+        await db.ha_quick_sales.update_one(
+            {"quick_sale_id": quick_sale_id, "cancellation_state": "cancelling"},
+            {"$unset": {
+                "cancellation_state": "",
+                "cancelling_at": "",
+                "cancelling_by": "",
+            }},
+        )
+        log.info(
+            "quick-sale cancel pre-flight rollback qs=%s reason=%s",
+            quick_sale_id, rollback_reason,
+        )
+
+    # ── Branch guard (after lock so we always release on early exit) ──
+    if not user_can_see_branch(user, qs.get("branch_id")):
+        await _release_lock("branch_access_denied")
+        raise HTTPException(status_code=403, detail="Branch access denied")
+
+    # ── Phase B · PRE-FLIGHT (READ-ONLY) ───────────────────────────
+    consumed_ids: List[str] = list(qs.get("consumed_serial_ids") or [])
+
+    # 1. Every consumed serial must be in SOLD state; otherwise we cannot
+    #    make a legal SOLD → RETURNED transition. This also catches units
+    #    that have been re-transitioned since the sale (SERVICE_IN, etc.).
+    serials_by_id: dict = {}
+    if consumed_ids:
+        cursor = db.serial_items.find(
+            {"serial_id": {"$in": consumed_ids}, "clinic_id": clinic_id},
+            {"_id": 0, "serial_id": 1, "serial_no": 1, "state": 1},
+        )
+        async for si in cursor:
+            serials_by_id[si["serial_id"]] = si
+    missing_serials = [sid for sid in consumed_ids if sid not in serials_by_id]
+    if missing_serials:
+        await _release_lock(f"missing_serials={missing_serials}")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Consumed serial(s) missing from inventory: "
+                f"{', '.join(missing_serials)}. Manual reconciliation required."
+            ),
+        )
+    wrong_state = [
+        f"{si['serial_no']} ({si['state']})"
+        for si in serials_by_id.values() if si["state"] != "SOLD"
+    ]
+    if wrong_state:
+        await _release_lock(f"serial_wrong_state={wrong_state}")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Cannot cancel — serial(s) are not in SOLD state: "
+                f"{', '.join(wrong_state)}. Use the appropriate service or "
+                f"return workflow first."
+            ),
+        )
+
+    # 2. Linked invoice must exist, not already be cancelled, and must
+    #    not already have a system-recorded refund row (kind='refund').
+    invoice_id = qs.get("invoice_id")
+    invoice = await db.invoices.find_one(
+        {"invoice_id": invoice_id, "clinic_id": clinic_id},
+        {"_id": 0},
+    )
+    if not invoice:
+        await _release_lock("invoice_missing")
+        raise HTTPException(status_code=409, detail="Linked invoice not found")
+    if (invoice.get("status") or "").lower() == "cancelled":
+        await _release_lock("invoice_already_cancelled")
+        raise HTTPException(status_code=409, detail="Linked invoice is already cancelled")
+
+    embedded_payments = invoice.get("payments") or []
+    existing_refunds = [
+        p for p in embedded_payments
+        if (p.get("kind") or "payment") == "refund"
+    ]
+    # Also check top-level db.payments for refunds referencing this invoice.
+    top_refund = await db.payments.find_one(
+        {"invoice_id": invoice_id, "clinic_id": clinic_id, "kind": "refund"},
+        {"_id": 0, "payment_id": 1},
+    )
+    if existing_refunds or top_refund:
+        await _release_lock("existing_refund")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "This invoice already has a system-recorded refund. "
+                "Cannot record additional cancellation reversal — reconcile "
+                "manually."
+            ),
+        )
+
+    # 3. Confirm offline-refund handling when any payment exists.
+    paid_total = round(float(invoice.get("paid_total") or 0), 2)
+    if paid_total > 0.005 and not payload.confirm_refund_offline:
+        await _release_lock("refund_not_confirmed")
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"This sale has collected ₹{paid_total:.2f}. Set "
+                f"confirm_refund_offline=true after reversing the money "
+                f"outside the system."
+            ),
+        )
+
+    reversible_payments = [
+        p for p in embedded_payments
+        if (p.get("kind") or "payment") == "payment"
+        and float(p.get("amount") or 0) > 0
+    ]
+
+    # ── Phase C · COMMIT (ORDERED) ─────────────────────────────────
+    # Step 1 — Serial reversal. `transition_serial` is CAS-guarded and
+    # raises 409 on race. If ANY hop fails we HALT before touching
+    # accessory / invoice / audit state so an operator can reconcile
+    # from a deterministic partial-serial state (`cancelling` lock is
+    # retained on the parent doc as a red flag).
+    serials_reverted: List[str] = []
+    for sid, si in serials_by_id.items():
+        try:
+            await transition_serial(
+                db, sid, "RETURNED",
+                actor_user_id=user["user_id"],
+                ref_doc={"kind": "quick_sale_cancel", "id": quick_sale_id},
+                note=f"Quick Sale {qs.get('sale_no')} cancelled: {payload.reason}",
+            )
+            serials_reverted.append(sid)
+        except HTTPException as exc:
+            # Halt without touching downstream state. Lock remains so
+            # the operator can reconcile.
+            log.warning(
+                "quick-sale cancel HALTED clinic=%s qs=%s serial=%s reason=%s "
+                "reverted_so_far=%d",
+                clinic_id, quick_sale_id, sid, exc.detail, len(serials_reverted),
+            )
+            raise HTTPException(
+                status_code=exc.status_code,
+                detail=(
+                    f"Cancellation halted mid-serial-reversal: {exc.detail}. "
+                    f"Serial(s) already reverted: {serials_reverted}. "
+                    f"Cancellation lock is held; contact admin for reconciliation."
+                ),
+            )
+
+    # Step 2 — Accessory reversal. Compensating $inc per reserved sku.
+    invoice_lines = invoice.get("lines") or []
+    accessory_reservations = []
+    for idx, ln in enumerate(invoice_lines):
+        if (ln.get("product_type") or "").lower() != "accessory":
+            continue
+        if not ln.get("accessory_stock_decremented"):
+            continue
+        qty = int(ln.get("quantity") or 0)
+        if qty <= 0:
+            continue
+        # Resolve the sku_id via the same product / branch / variant path
+        # used by the reservation helper.
+        product_id = ln.get("accessory_product_id")
+        if not product_id:
+            brand = (ln.get("make") or "").strip()
+            model = (ln.get("model") or "").strip()
+            if brand and model:
+                prod = await db.ha_products.find_one(
+                    {"clinic_id": clinic_id,
+                     "make": {"$regex": f"^{re.escape(brand)}$", "$options": "i"},
+                     "model": {"$regex": f"^{re.escape(model)}$", "$options": "i"}},
+                    {"_id": 0, "product_id": 1},
+                )
+                product_id = prod.get("product_id") if prod else None
+        stock = None
+        if product_id:
+            q_stock: dict = {"clinic_id": clinic_id, "product_id": product_id}
+            if qs.get("branch_id"):
+                q_stock["branch_id"] = qs["branch_id"]
+            variant = ln.get("accessory_variant")
+            q_stock["variant"] = variant  # None matches None
+            stock = await db.accessory_stock.find_one(q_stock, {"_id": 0, "sku_id": 1})
+        if not stock:
+            log.warning(
+                "quick-sale cancel accessory restore skipped clinic=%s qs=%s "
+                "line_index=%d — no sku match",
+                clinic_id, quick_sale_id, idx,
+            )
+            continue
+        accessory_reservations.append({
+            "sku_id": stock["sku_id"],
+            "product_id": product_id,
+            "qty": qty,
+            "line_index": idx,
+        })
+    if accessory_reservations:
+        await restore_accessory_stock(
+            db, accessory_reservations,
+            clinic_id=clinic_id,
+            actor_user_id=user["user_id"],
+            reason=f"quick_sale_cancel:{quick_sale_id}",
+        )
+        # Flip the flag back so downstream helpers don't re-attribute.
+        for r in accessory_reservations:
+            idx = r["line_index"]
+            if 0 <= idx < len(invoice_lines):
+                invoice_lines[idx]["accessory_stock_decremented"] = False
+
+    # Step 3 — Offline-refund audit rows. ONE row PER reversed payment.
+    payment_reversal_ids: List[str] = []
+    for pay in reversible_payments:
+        reversal_id = f"REV-{uuid.uuid4().hex[:10].upper()}"
+        reversal_doc = {
+            "reversal_id": reversal_id,
+            "kind": "cancellation_reversal",
+            "clinic_id": clinic_id,
+            "branch_id": qs.get("branch_id"),
+            "quick_sale_id": quick_sale_id,
+            "sale_no": qs.get("sale_no"),
+            "invoice_id": invoice_id,
+            "invoice_no": invoice.get("invoice_no"),
+            "original_payment_id": pay.get("payment_id"),
+            "original_method": pay.get("method"),
+            "original_paid_at": pay.get("paid_at"),
+            "amount": round(float(pay.get("amount") or 0), 2),
+            "actor_user_id": user["user_id"],
+            "actor_name": user.get("name", ""),
+            "reason": payload.reason,
+            "notes": payload.notes or "",
+            "offline_refund_acknowledged": True,
+            "at": now_iso,
+        }
+        await db.payment_reversals.insert_one(dict(reversal_doc))
+        payment_reversal_ids.append(reversal_id)
+
+    # Step 4 — Invoice cancel. paid_total / refunded_total are LEFT
+    # UNTOUCHED to preserve historical audit; due_total goes to 0.
+    await db.invoices.update_one(
+        {"invoice_id": invoice_id, "clinic_id": clinic_id},
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_at": now_iso,
+            "cancelled_reason": (
+                f"Quick Sale cancelled: {payload.reason}"
+                + (f" — {payload.notes}" if payload.notes else "")
+            ),
+            "cancelled_by_user_id": user["user_id"],
+            "due_total": 0.0,
+            "cancellation_reversal_ids": payment_reversal_ids,
+            "lines": invoice_lines,
+        }},
+    )
+
+    # Step 5 — Quick sale + fitting.
+    await db.ha_quick_sales.update_one(
+        {"quick_sale_id": quick_sale_id, "clinic_id": clinic_id},
+        {"$set": {
+            "cancellation_state": "cancelled",
+            "cancelled_at": now_iso,
+            "cancelled_by_user_id": user["user_id"],
+            "cancelled_reason": payload.reason,
+            "cancellation_notes": payload.notes or "",
+            "status": "cancelled",
+            "cancellation_reversal_ids": payment_reversal_ids,
+            "serials_reverted": serials_reverted,
+        }},
+    )
+    await db.ha_fittings.update_one(
+        {"quick_sale_id": quick_sale_id, "clinic_id": clinic_id},
+        {"$set": {
+            "status": "cancelled",
+            "cancelled_at": now_iso,
+            "cancelled_reason": payload.reason,
+            "updated_at": now_iso,
+        }},
+    )
+
+    log.info(
+        "quick-sale cancelled clinic=%s qs=%s invoice=%s serials=%d "
+        "accessory_lines=%d reversals=%d",
+        clinic_id, quick_sale_id, invoice_id,
+        len(serials_reverted), len(accessory_reservations),
+        len(payment_reversal_ids),
+    )
+
+    return CancelQuickSaleOut(
+        quick_sale_id=quick_sale_id,
+        invoice_id=invoice_id,
+        invoice_no=invoice.get("invoice_no") or "",
+        status="cancelled",
+        cancellation_state="cancelled",
+        serials_reverted=serials_reverted,
+        accessory_lines_restored=len(accessory_reservations),
+        payment_reversal_ids=payment_reversal_ids,
+        total=float(invoice.get("grand_total") or invoice.get("rounded_total") or 0),
+        paid_total=paid_total,
+        refunded_total=round(float(invoice.get("refunded_total") or 0), 2),
     )

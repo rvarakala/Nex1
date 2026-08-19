@@ -59,23 +59,46 @@ async def transition_serial(
 ) -> dict:
     """Atomically moves a SerialItem to `to_state` and writes the audit row.
 
+    NAV-010 · INV-001 · The write is a compare-and-swap: the invoice update
+    matches on `(serial_id, state=from_state)`, so two concurrent transitions
+    from the same source state cannot both succeed — the loser gets
+    ``matched_count = 0`` and this helper surfaces a controlled 409.
+
     `ref_doc` should be a small dict describing the triggering record, e.g.
     {"kind": "grn", "id": "GRN-2026-0001"} or {"kind": "sale", "id": "SAL-…"}.
-    Returns the updated SerialItem doc (minus _id)."""
+    Returns the updated SerialItem doc (minus _id).
+    """
     si = await db.serial_items.find_one({"serial_id": serial_id}, {"_id": 0})
     if not si:
         raise HTTPException(status_code=404, detail="Serial item not found")
 
-    assert_transition(si["state"], to_state)
+    from_state = si["state"]
+    assert_transition(from_state, to_state)
 
     now = datetime.now(timezone.utc).isoformat()
-    await db.serial_items.update_one(
-        {"serial_id": serial_id},
+    result = await db.serial_items.update_one(
+        # CAS — only match if the state is still the observed one.
+        {"serial_id": serial_id, "state": from_state},
         {"$set": {"state": to_state, "updated_at": now}},
     )
+    if result.matched_count == 0:
+        # Race lost — another writer changed the state between our read
+        # and our CAS. Fetch current state for a helpful error.
+        fresh = await db.serial_items.find_one(
+            {"serial_id": serial_id}, {"_id": 0, "state": 1},
+        )
+        actual = fresh.get("state") if fresh else "(missing)"
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Serial {serial_id} is no longer in state {from_state} "
+                f"(now {actual}); refresh and retry."
+            ),
+        )
+
     await db.serial_events.insert_one({
         "serial_id": serial_id,
-        "from": si["state"],
+        "from": from_state,
         "to": to_state,
         "at": now,
         "actor_user_id": actor_user_id,
