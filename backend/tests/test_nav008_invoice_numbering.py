@@ -156,7 +156,60 @@ async def _bootstrap() -> None:
 @pytest.fixture(scope="module", autouse=True)
 def _bootstrap_module():
     _run(_bootstrap())
+    _run(_install_test_scoped_unique_index())
     yield
+    _run(_drop_test_scoped_unique_index())
+
+
+# ─── NAV-008 Phase 3B test-scoped unique index ───────────────────────────
+# The main compound unique index (`clinic_id_1_invoice_no_1_unique`) is
+# CLUSTER-wide and cannot be installed on Preview while the known
+# historical duplicate `INV/2026/000004` exists in `tenant-sound-clinic-blr`.
+#
+# To let tests 3, 7, 14 exercise the DB-level uniqueness guarantee AND
+# the retry helper end-to-end, we install a narrower NAV-008-scoped index
+# at module fixture time. It only enforces uniqueness for clinic_ids that
+# begin with `NAV008-` — so the historical duplicate in a real-clinic
+# namespace is untouched, and the test tenants get the full DB-level
+# safeguard. The index is dropped at module teardown so no persistent
+# state remains.
+#
+# This is a TEST-ONLY technique. Production and Preview app startup
+# continue to attempt the un-scoped index; the try/except wrapper in
+# server.py surfaces a loud error when that fails on Preview.
+_TEST_INDEX_NAME = "nav008_test_scoped_invoice_no_unique"
+
+
+async def _install_test_scoped_unique_index() -> None:
+    client, db = await _db()
+    try:
+        # Drop first in case a prior test module aborted mid-run.
+        try:
+            await db.invoices.drop_index(_TEST_INDEX_NAME)
+        except Exception:
+            pass
+        await db.invoices.create_index(
+            [("clinic_id", 1), ("invoice_no", 1)],
+            unique=True,
+            partialFilterExpression={
+                "invoice_no": {"$type": "string"},
+                "clinic_id": {"$in": [CLINIC_A, CLINIC_B]},
+            },
+            name=_TEST_INDEX_NAME,
+        )
+    finally:
+        client.close()
+
+
+async def _drop_test_scoped_unique_index() -> None:
+    client, db = await _db()
+    try:
+        try:
+            await db.invoices.drop_index(_TEST_INDEX_NAME)
+        except Exception:
+            pass
+    finally:
+        client.close()
 
 
 @pytest.fixture(autouse=True)
@@ -228,41 +281,17 @@ def test_02_concurrent_creation_produces_distinct_numbers():
 def test_03_same_clinic_duplicate_rejected_by_unique_index_or_retry():
     """After the compound unique index is installed, a raw insert of a
     duplicate (clinic_id, invoice_no) MUST fail with E11000. This test
-    verifies the DB-level guarantee.
+    verifies the DB-level guarantee against our test-scoped index."""
+    tok = _login_a()
+    r = _create_invoice(tok, SVC_ID_A, PATIENT_A)
+    assert r.status_code == 200
+    existing_no = r.json()["invoice_no"]
+    # Try a raw insert with the same (clinic_id, invoice_no) → must fail.
+    from pymongo.errors import DuplicateKeyError
 
-    Skipped gracefully if the index is not installed on Preview (which
-    happens only when the pre-existing preview duplicate has not been
-    remediated — a known documented condition of NAV-008 Phase 3A)."""
-    async def _probe():
+    async def _dup_insert():
         client, db = await _db()
         try:
-            idxs = await db.invoices.list_indexes().to_list(None)
-            has_unique = any(
-                i.get("name") == "clinic_id_1_invoice_no_1_unique"
-                and i.get("unique") is True
-                for i in idxs
-            )
-            return has_unique, client, db
-        except Exception:
-            client.close()
-            raise
-
-    has_unique, client, db = _run(_probe())
-    try:
-        if not has_unique:
-            pytest.skip(
-                "Compound unique index not installed on this Preview DB "
-                "(existing duplicates present). Fix is deployed; index "
-                "installs cleanly on Production per NAV-008 Phase 3A."
-            )
-        tok = _login_a()
-        r = _create_invoice(tok, SVC_ID_A, "NAV008A-DUP")
-        assert r.status_code == 200
-        existing_no = r.json()["invoice_no"]
-        # Try a raw insert with the same (clinic_id, invoice_no) → must fail.
-        from pymongo.errors import DuplicateKeyError
-
-        async def _dup_insert():
             try:
                 await db.invoices.insert_one({
                     "invoice_id": "INV-DUPTEST",
@@ -274,11 +303,11 @@ def test_03_same_clinic_duplicate_rejected_by_unique_index_or_retry():
                 return None
             except DuplicateKeyError as e:
                 return str(e)
+        finally:
+            client.close()
 
-        err = _run(_dup_insert())
-        assert err is not None and ("11000" in err or "duplicate" in err.lower()), err
-    finally:
-        client.close()
+    err = _run(_dup_insert())
+    assert err is not None and ("11000" in err or "duplicate" in err.lower()), err
 
 
 def test_04_cross_clinic_same_number_allowed():
@@ -351,13 +380,6 @@ def test_07_duplicate_key_retry_helper_produces_next_number():
         client, db = await _db()
         try:
             year = datetime.now(timezone.utc).year
-            # Only meaningful if the unique index exists — otherwise the
-            # helper never sees a duplicate error at all.
-            idxs = await db.invoices.list_indexes().to_list(None)
-            has_unique = any(i.get("name") == "clinic_id_1_invoice_no_1_unique"
-                             for i in idxs)
-            if not has_unique:
-                return "SKIP"
             # Occupy INV/{year}/000001 via a raw insert.
             occupied_no = f"INV/{year}/000001"
             try:
@@ -391,8 +413,6 @@ def test_07_duplicate_key_retry_helper_produces_next_number():
             client.close()
 
     out = _run(_do())
-    if out == "SKIP":
-        pytest.skip("unique index not installed on Preview — see test_03")
     # The helper must have advanced past the occupied number.
     assert out != f"INV/{datetime.now(timezone.utc).year}/000001", \
         f"helper did not renew; still landed on {out}"
@@ -506,12 +526,6 @@ def test_14_missing_invoice_no_partial_index_bypass():
     async def _do():
         client, db = await _db()
         try:
-            # Only meaningful when the index exists.
-            idxs = await db.invoices.list_indexes().to_list(None)
-            has_unique = any(i.get("name") == "clinic_id_1_invoice_no_1_unique"
-                             for i in idxs)
-            if not has_unique:
-                return "SKIP"
             # Two docs with same clinic_id and null invoice_no.
             await db.invoices.insert_one({
                 "invoice_id": "INV-NULL-A",
@@ -533,8 +547,6 @@ def test_14_missing_invoice_no_partial_index_bypass():
             client.close()
 
     out = _run(_do())
-    if out == "SKIP":
-        pytest.skip("unique index not installed on Preview — see test_03")
     assert out == 2, f"expected 2 null-invoice_no rows to coexist, got {out}"
 
 
@@ -784,23 +796,27 @@ def test_22_ha_sales_linked_invoice_no_pattern_preserved():
 
 
 def test_23_reconcile_script_refuses_without_env_gate():
-    """Refuses execution unless NAV008_MIGRATE=1 is set. Sanity-check
-    the CLI safety gate without actually launching a subprocess."""
+    """Refuses execution unless BOTH `NAV008_MIGRATE=1` AND (post-Phase 3B)
+    `NAV008_MIGRATE_OVERRIDE=1` are set. Sanity-check both safety gates
+    without launching a full migration."""
     import subprocess
     import sys
     script = "/app/backend/scripts/nav008_counter_reconcile.py"
-    # Env WITHOUT the gate.
+    # Env WITHOUT either gate — must refuse (Phase 3B override missing).
     proc = subprocess.run(
         [sys.executable, script, "--dry-run"],
         capture_output=True, text=True, timeout=15,
-        env={**os.environ, "NAV008_MIGRATE": ""},
+        env={**{k: v for k, v in os.environ.items()
+                if k not in {"NAV008_MIGRATE", "NAV008_MIGRATE_OVERRIDE"}}},
     )
-    assert "REFUSED" in proc.stdout or proc.returncode == 2, \
-        f"reconcile should refuse; stdout={proc.stdout!r} stderr={proc.stderr!r} rc={proc.returncode}"
+    assert "REFUSED" in proc.stdout or proc.returncode != 0, \
+        f"reconcile should refuse; stdout={proc.stdout!r} rc={proc.returncode}"
 
 
-def test_24_reconcile_script_dry_run_no_writes():
-    """With gate + dry-run, script scans but performs no writes."""
+def test_24_reconcile_script_dry_run_no_writes_with_override():
+    """With BOTH gates set + --dry-run, script scans but performs no writes.
+    Post-Phase 3B the override is required as a belt-and-braces safeguard;
+    without it the script refuses (see test_23 and test_29)."""
     import subprocess
     import sys
     script = "/app/backend/scripts/nav008_counter_reconcile.py"
@@ -817,7 +833,9 @@ def test_24_reconcile_script_dry_run_no_writes():
     proc = subprocess.run(
         [sys.executable, script, "--dry-run"],
         capture_output=True, text=True, timeout=60,
-        env={**os.environ, "NAV008_MIGRATE": "1"},
+        env={**os.environ,
+             "NAV008_MIGRATE": "1",
+             "NAV008_MIGRATE_OVERRIDE": "1"},
     )
     assert proc.returncode == 0, f"dry-run failed: {proc.stdout} {proc.stderr}"
     after = _run(_snapshot())
@@ -837,4 +855,181 @@ def test_25_invoice_no_field_never_regresses_to_invoice_number_field():
         )
     assert '"invoice_no":' in src, (
         "seed_story_demo.py must use canonical `invoice_no` field"
+    )
+
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# NAV-008 Phase 3B · Decision-6 explicit collide-then-retry coverage
+# ══════════════════════════════════════════════════════════════════════════
+# The Preview dry-run demonstrated that historical uuid-hex invoice numbers
+# can be indistinguishable from canonical counter output when the hex tail
+# happens to be all-digits. Global counter reconciliation was deferred; the
+# safeguard is now the retry-helper + unique-index combo. These tests
+# verify that combo end-to-end under the exact scenario the reconciliation
+# was intended to prevent.
+
+
+def test_26_collide_with_historical_low_seq_then_retry_succeeds():
+    """Explicit end-to-end coverage of the deferred-reconciliation scenario.
+
+    Scenario:
+      1. Counter starts at 0 (below any historical invoice number).
+      2. A historical invoice at INV/{year}/000001 already occupies the
+         first counter output — simulating a seed-inserted or uuid-hex
+         invoice that pre-dates the sprint.
+      3. A brand-new POST /billing/invoices comes in via the normal
+         path (billing.create_invoice → _insert_invoice_with_retry).
+      4. The DB unique index raises E11000 on the first attempt.
+      5. The retry helper renews via _next_invoice_no and succeeds on
+         attempt 2 with INV/{year}/000002.
+      6. The historical invoice remains untouched.
+      7. No invoice is renumbered.
+      8. Counter is left at 2.
+    """
+    year = datetime.now(timezone.utc).year
+
+    async def _setup():
+        client, db = await _db()
+        try:
+            # Reset counter to 0.
+            await db.counters.update_one(
+                {"_id": f"invoice:{CLINIC_A}:{year}"},
+                {"$set": {"seq": 0}},
+                upsert=True,
+            )
+            # Occupy INV/{year}/000001 with a historical invoice.
+            await db.invoices.insert_one({
+                "invoice_id": "INV-HIST-001",
+                "clinic_id": CLINIC_A,
+                "invoice_no": f"INV/{year}/000001",
+                "patient_id": "P-HIST",
+                "grand_total": 999.0,
+                "status": "paid",
+                "invoice_date": datetime.now(timezone.utc).isoformat(),
+            })
+        finally:
+            client.close()
+    _run(_setup())
+
+    tok = _login_a()
+    r = _create_invoice(tok, SVC_ID_A, PATIENT_A)
+    assert r.status_code == 200, r.text
+    got = r.json()["invoice_no"]
+    # Retry must have advanced past 000001.
+    assert got == f"INV/{year}/000002", (
+        f"expected INV/{year}/000002 (retry from occupied 000001); got {got}"
+    )
+
+    async def _verify():
+        client, db = await _db()
+        try:
+            # Historical invoice remains present + unchanged.
+            hist = await db.invoices.find_one({"invoice_id": "INV-HIST-001"})
+            assert hist is not None and hist["invoice_no"] == f"INV/{year}/000001"
+            # Counter now at 2.
+            ctr = await db.counters.find_one({"_id": f"invoice:{CLINIC_A}:{year}"})
+            return ctr["seq"]
+        finally:
+            client.close()
+    assert _run(_verify()) == 2
+
+
+def test_27_collide_with_multiple_historical_gaps_retry_bounded():
+    """Counter starts at 0; historical rows occupy 000001, 000002, 000003.
+    A single new POST must succeed on attempt 4 (retry limit is 3) → the
+    helper CANNOT recover from 3 consecutive collisions. Verify the
+    controlled 500 fires and the historical invoices remain untouched.
+
+    This is the failure-mode test — proves the helper does NOT loop
+    forever and surfaces a clean application error when the retry budget
+    is exhausted."""
+    year = datetime.now(timezone.utc).year
+
+    async def _setup():
+        client, db = await _db()
+        try:
+            await db.counters.update_one(
+                {"_id": f"invoice:{CLINIC_A}:{year}"},
+                {"$set": {"seq": 0}},
+                upsert=True,
+            )
+            for n in (1, 2, 3):
+                await db.invoices.insert_one({
+                    "invoice_id": f"INV-HIST3-{n}",
+                    "clinic_id": CLINIC_A,
+                    "invoice_no": f"INV/{year}/{str(n).zfill(6)}",
+                    "patient_id": "P-HIST3",
+                    "grand_total": 100.0,
+                    "status": "paid",
+                    "invoice_date": datetime.now(timezone.utc).isoformat(),
+                })
+        finally:
+            client.close()
+    _run(_setup())
+
+    tok = _login_a()
+    r = _create_invoice(tok, SVC_ID_A, PATIENT_A)
+    # 3 retries exhausted → helper raises HTTPException 500 with
+    # a controlled message (never leaks Mongo E11000).
+    assert r.status_code == 500, r.text
+    assert "conflict" in r.text.lower() or "retry" in r.text.lower(), r.text
+
+    async def _verify():
+        client, db = await _db()
+        try:
+            # None of the historical invoices are modified.
+            for n in (1, 2, 3):
+                doc = await db.invoices.find_one({"invoice_id": f"INV-HIST3-{n}"})
+                assert doc is not None
+                assert doc["invoice_no"] == f"INV/{year}/{str(n).zfill(6)}"
+        finally:
+            client.close()
+    _run(_verify())
+
+
+def test_28_cross_clinic_identical_numbers_still_allowed_after_index():
+    """The test-scoped unique index is on (clinic_id, invoice_no) — NOT
+    global invoice_no. Verify Clinic A and Clinic B can both host their
+    own INV/YYYY/000001 without either failing at the DB layer."""
+    year = datetime.now(timezone.utc).year
+
+    async def _setup():
+        client, db = await _db()
+        try:
+            for cid in (CLINIC_A, CLINIC_B):
+                await db.counters.update_one(
+                    {"_id": f"invoice:{cid}:{year}"},
+                    {"$set": {"seq": 0}}, upsert=True,
+                )
+        finally:
+            client.close()
+    _run(_setup())
+
+    r_a = _create_invoice(_login_a(), SVC_ID_A, PATIENT_A)
+    r_b = _create_invoice(_login_b(), SVC_ID_B, PATIENT_B)
+    assert r_a.status_code == 200 and r_b.status_code == 200
+    assert r_a.json()["invoice_no"] == f"INV/{year}/000001"
+    assert r_b.json()["invoice_no"] == f"INV/{year}/000001"
+
+
+def test_29_reconciler_script_refuses_execution_after_phase_3b_decision():
+    """Phase 3B deferred the reconciler. Even with NAV008_MIGRATE=1,
+    it must refuse to run — enforced by the additional
+    NAV008_MIGRATE_OVERRIDE=1 gate. Belt-and-braces safety."""
+    import subprocess
+    import sys
+    script = "/app/backend/scripts/nav008_counter_reconcile.py"
+    proc = subprocess.run(
+        [sys.executable, script, "--dry-run"],
+        capture_output=True, text=True, timeout=15,
+        env={**os.environ, "NAV008_MIGRATE": "1"},  # note: no override
+    )
+    # Should refuse: return code 3 (Phase 3B deferral).
+    assert proc.returncode == 3, (
+        f"reconciler must refuse without NAV008_MIGRATE_OVERRIDE=1; "
+        f"got rc={proc.returncode} stdout={proc.stdout!r}"
+    )
+    assert "NOT APPROVED FOR EXECUTION" in proc.stdout, (
+        f"deferred-execution banner missing; stdout={proc.stdout!r}"
     )

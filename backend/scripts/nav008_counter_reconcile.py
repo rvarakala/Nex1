@@ -1,7 +1,36 @@
-"""NAV-008 · Counter Reconciliation Script
+"""NAV-008 · Counter Reconciliation Script — ⛔ NOT APPROVED FOR EXECUTION ⛔
 
-Purpose
--------
+======================================================================
+DEFERRED — DO NOT RUN
+======================================================================
+This script is retained in the repository FOR REFERENCE ONLY. It is
+NOT approved for execution against Preview OR Production, per the
+NAV-008 Phase 3B decision made after the Preview dry-run demonstrated
+that historical uuid-hex invoice numbers can be indistinguishable
+at the database level from genuine counter-generated numbers when the
+six-character uuid suffix happens to contain only digits.
+
+Concrete evidence from the Preview dry-run (2026-08):
+  - `BR-CL-4601C9DF:2026`     max_used=228,264   (uuid-hex noise)
+  - `tenant-sound-clinic-blr:2026`  max_used=885,695   (uuid-hex noise)
+
+Advancing counters to those values would be a financial-data-integrity
+regression. Provenance cannot be inferred from `invoice_no` alone.
+
+The correct architectural safeguard against the "counter under-shoots
+an already-occupied number" edge case is the combination of the
+compound unique index `clinic_id_1_invoice_no_1_unique` plus the
+retry helper `billing._insert_invoice_with_retry`, both of which
+were installed in NAV-008 Phase 3A. Those two mechanisms make this
+reconciliation script unnecessary — see Phase 3B design memo.
+
+Removal of this file is a documentation decision reserved for a
+future clean-up sprint. Do NOT remove it silently as part of any
+current sprint.
+======================================================================
+
+Purpose (historical)
+--------------------
 The Preview NAV-008 audit surfaced a class of duplicates caused by
 invoice writers that DID NOT increment `db.counters._id="invoice:
 {clinic_id}:{year}"` when assigning invoice numbers. Concrete examples:
@@ -69,6 +98,19 @@ CANONICAL_INVOICE_NO_RE = re.compile(r"^INV/(\d{4})/(\d{6})$")
 
 
 async def _run(dry_run: bool) -> int:
+    # NAV-008 Phase 3B safety refusal — this script is DEFERRED and
+    # cannot be executed. The dry-run demonstrated it produces unsafe
+    # counter advances. See docstring for the full architectural memo.
+    print(
+        "REFUSED · NAV-008 Phase 3B decision: this reconciliation script "
+        "is NOT APPROVED FOR EXECUTION.\n"
+        "         The safeguard is now `_insert_invoice_with_retry` "
+        "in billing.py + the compound unique index. See docstring.\n"
+        "         To force execution anyway, set NAV008_MIGRATE_OVERRIDE=1 "
+        "(NOT recommended)."
+    )
+    if os.environ.get("NAV008_MIGRATE_OVERRIDE") != "1":
+        return 3
     if os.environ.get("NAV008_MIGRATE") != "1":
         print(
             "REFUSED · Set NAV008_MIGRATE=1 to authorise this migration.\n"
