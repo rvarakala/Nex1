@@ -38,7 +38,7 @@ from motor.motor_asyncio import AsyncIOMotorClient
 
 BASE_URL = os.environ.get(
     "REACT_APP_BACKEND_URL",
-    "https://referral-payout-lab.preview.emergentagent.com",
+    "https://referral-sprint.preview.emergentagent.com",
 ).rstrip("/")
 API = f"{BASE_URL}/api"
 WEBHOOK_URL = f"{API}/billing/razorpay/webhook"

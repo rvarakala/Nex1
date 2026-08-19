@@ -3,7 +3,7 @@ import os
 import requests
 import pytest
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-payout-lab.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-sprint.preview.emergentagent.com").rstrip("/")
 
 REQUIRED_ROW_KEYS = {
     "doctor_id", "name", "diagnostics_revenue", "ha_sales_revenue",

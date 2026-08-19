@@ -3,7 +3,7 @@ import os
 import uuid
 import requests
 
-BASE = "https://referral-payout-lab.preview.emergentagent.com"
+BASE = "https://referral-sprint.preview.emergentagent.com"
 EMAIL = "dltest@example.com"
 PASSWORD = "TestPass@123"
 

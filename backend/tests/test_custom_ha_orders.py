@@ -16,7 +16,7 @@ import requests
 
 BASE_URL = os.environ.get(
     "REACT_APP_BACKEND_URL",
-    "https://referral-payout-lab.preview.emergentagent.com",
+    "https://referral-sprint.preview.emergentagent.com",
 ).rstrip("/")
 EMAIL = "owner@thesoundclinic.in"
 PASSWORD = "demo123"

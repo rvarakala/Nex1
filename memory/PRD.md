@@ -1985,7 +1985,7 @@ Fix: both relaxed to `Optional[str] = None` on the response model.
 - Backend pytest: 9/9 pass across `test_referral_flat_payout_scoping.py`, `test_referral_ha_wing_bucketing.py` (4 new), `test_referring_doctor_autofill.py` (2 new).
 - E2E API scripts (persisted under `tests/e2e_bug1_referral_payout.py` and `e2e_bug3_queue_start_autofill.py`) confirm the dashboard produces `ha_sales_revenue=30000, ha_payout=5000` for both new (`product_type='Hearing Aid'`) and legacy (missing `product_type`) invoice shapes.
 - Playwright: patient prefill in Book Appointment modal verified from Patient Profile; reload regression confirmed.
-- Preview URL: https://referral-payout-lab.preview.emergentagent.com
+- Preview URL: https://referral-sprint.preview.emergentagent.com
 
 ### Files touched
 - `backend/routers/report_handover.py` (LineItemIn + HA wing auto-tag)
@@ -3467,7 +3467,7 @@ enrolls TOTP (grace period already expired).
 
 ### 🔒 Prod env changes
 - `CORS_ORIGINS` — was `"*"` (auto-ignored with a loud log). Now an
-  explicit allowlist: `https://audinexa.com,https://www.audinexa.com,https://referral-payout-lab.preview.emergentagent.com`.
+  explicit allowlist: `https://audinexa.com,https://www.audinexa.com,https://referral-sprint.preview.emergentagent.com`.
   Verified: `audinexa.com` + `www.audinexa.com` return 200 with explicit
   `Access-Control-Allow-Origin` echo; `evil.com` returns **400 Bad Request**.
 - `PUBLIC_APP_URL` — was preview subdomain. Now `https://audinexa.com`.
@@ -6815,7 +6815,7 @@ A 1-page navigation map covering: backend models domain index, router-by-router 
 
 **Card payment verified live**: ₹11.80 captured successfully on Apr 29 2026 09:08 PM IST. Payment ID `pay_SjMQP2nWTcUtC1`, order `order_SjMPYGm2GTMfOh`, tenant invoice `TIN-E45B4DC1` reconciled to `paid` status (`paid_via: checkout`).
 
-**Webhook secret configured**: User created webhook on Razorpay Dashboard pointing at `https://referral-payout-lab.preview.emergentagent.com/api/billing/razorpay/webhook` with events `payment.captured` + `payment.failed` + email alerts. Secret pasted into `/app/backend/.env` (`RAZORPAY_WEBHOOK_SECRET`). Backend restarted clean. All 5 webhook regression tests pass against the live secret — signature verification, capture, order-ID fallback, replay idempotency, and failed-payment reason recording all confirmed working.
+**Webhook secret configured**: User created webhook on Razorpay Dashboard pointing at `https://referral-sprint.preview.emergentagent.com/api/billing/razorpay/webhook` with events `payment.captured` + `payment.failed` + email alerts. Secret pasted into `/app/backend/.env` (`RAZORPAY_WEBHOOK_SECRET`). Backend restarted clean. All 5 webhook regression tests pass against the live secret — signature verification, capture, order-ID fallback, replay idempotency, and failed-payment reason recording all confirmed working.
 
 **Original UPI block diagnosis** (the "website does not match registered website" error): confirmed Razorpay-side merchant-paying-themselves quirk on UPI in live mode — does NOT affect real customers paying from their own UPI VPAs. Card payments and customer-side UPI work correctly. No code change required.
 
@@ -6908,7 +6908,7 @@ A 1-page navigation map covering: backend models domain index, router-by-router 
 - Live UI: Founder admin → Tenants → beta-01 → Billing tab now shows Tenant invoices table with `[Pay]` button on pending TIN-A1EC2A87. Lint clean across all 4 touched files.
 
 **Pending owner action** (non-blocking):
-- Webhook URL `https://referral-payout-lab.preview.emergentagent.com/api/billing/razorpay/webhook` to be registered on Razorpay Dashboard with `RAZORPAY_WEBHOOK_SECRET` copied to `.env`.
+- Webhook URL `https://referral-sprint.preview.emergentagent.com/api/billing/razorpay/webhook` to be registered on Razorpay Dashboard with `RAZORPAY_WEBHOOK_SECRET` copied to `.env`.
 
 ⚠️ **LIVE keys in use** — every Pay click charges real money for the subscription invoice amount (e.g. ₹14,158 for annual Premium).
 
@@ -6935,7 +6935,7 @@ A 1-page navigation map covering: backend models domain index, router-by-router 
 - Live UI: Pay button → modal → Razorpay iframe loads with "Secured By Razorpay" shield, zero page errors. Lint clean.
 
 **Pending owner action** (non-blocking):
-- Register webhook URL `https://referral-payout-lab.preview.emergentagent.com/api/billing/razorpay/webhook` on Razorpay Dashboard → Webhooks → subscribe to `payment.captured` + `payment.failed` → copy secret to `.env` as `RAZORPAY_WEBHOOK_SECRET` → restart backend.
+- Register webhook URL `https://referral-sprint.preview.emergentagent.com/api/billing/razorpay/webhook` on Razorpay Dashboard → Webhooks → subscribe to `payment.captured` + `payment.failed` → copy secret to `.env` as `RAZORPAY_WEBHOOK_SECRET` → restart backend.
 
 ⚠️ **LIVE keys in use — every Pay click charges real money. Test with ₹1 invoices first.**
 

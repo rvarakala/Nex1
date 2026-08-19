@@ -3,7 +3,7 @@ import os
 import requests
 import pytest
 
-BASE = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-payout-lab.preview.emergentagent.com").rstrip("/")
+BASE = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-sprint.preview.emergentagent.com").rstrip("/")
 EMAIL = "owner@thesoundclinic.in"
 PWD = "demo123"
 BRANCH_ID = "BR-SOUNDCLINIC-HQ"

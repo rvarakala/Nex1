@@ -1,5 +1,5 @@
 {
-  "summary": "Phase B (items #2 Auto-open Book Modal + #3 HA/Service chips + Wing routing) tested end-to-end. Backend pytest suite (5 new tests in /app/backend/tests/test_appointment_ha_wing.py) all PASSED. Frontend Playwright run against https://referral-payout-lab.preview.emergentagent.com covered the New-Patient → auto-open flow, all 9 HA chips, invoice auto-fill, wing-switch cleanup, missing-hint copy, and reload-negative case — every review-request assertion succeeded.",
+  "summary": "Phase B (items #2 Auto-open Book Modal + #3 HA/Service chips + Wing routing) tested end-to-end. Backend pytest suite (5 new tests in /app/backend/tests/test_appointment_ha_wing.py) all PASSED. Frontend Playwright run against https://referral-sprint.preview.emergentagent.com covered the New-Patient → auto-open flow, all 9 HA chips, invoice auto-fill, wing-switch cleanup, missing-hint copy, and reload-negative case — every review-request assertion succeeded.",
   "backend_issues": {"critical": [], "minor": []},
   "frontend_issues": {
     "ui_bugs": [

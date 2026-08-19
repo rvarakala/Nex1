@@ -14,7 +14,7 @@ import requests
 
 BASE_URL = os.environ.get(
     "REACT_APP_BACKEND_URL",
-    "https://referral-payout-lab.preview.emergentagent.com",
+    "https://referral-sprint.preview.emergentagent.com",
 ).rstrip("/")
 FOUNDER_EMAIL = "founder@audinexa.com"
 FOUNDER_PASSWORD = "AudinexaFounder@2026"

@@ -93,7 +93,7 @@ The flow today:
 
 ### 🟡 2. Production `.env` needs 3 updates
 - `CORS_ORIGINS="*"` → change to `"https://audinexa.com,https://www.audinexa.com"` (wildcard is auto-ignored by our fallback but explicit is safer).
-- `PUBLIC_APP_URL="https://referral-payout-lab.preview.emergentagent.com"` → change to `"https://audinexa.com"` (impacts share-link generation, email footer URLs).
+- `PUBLIC_APP_URL="https://referral-sprint.preview.emergentagent.com"` → change to `"https://audinexa.com"` (impacts share-link generation, email footer URLs).
 - `MFA_ENFORCEMENT_DISABLED="1"` → set to `"0"` for founder + super_admin accounts (5-min job, protects your admin panel).
 
 ### 🟡 3. Add "self-serve upgrade" CTA (P1, but nice-to-have for launch)

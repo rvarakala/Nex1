@@ -54,7 +54,7 @@ mutated, moved, or renamed under v2.
 
 ```bash
 # In preview environment:
-curl -s https://referral-payout-lab.preview.emergentagent.com/legacy-landing \
+curl -s https://referral-sprint.preview.emergentagent.com/legacy-landing \
   | grep -oE "(Beta cohort|Join waitlist|Audiology Clinic OS)" | head -3
 ```
 

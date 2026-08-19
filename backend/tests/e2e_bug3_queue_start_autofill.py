@@ -2,7 +2,7 @@
 import uuid
 import requests
 
-BASE = "https://referral-payout-lab.preview.emergentagent.com"
+BASE = "https://referral-sprint.preview.emergentagent.com"
 
 
 def login(email, password):

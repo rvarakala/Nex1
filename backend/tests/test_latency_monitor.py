@@ -11,7 +11,7 @@ import time
 import requests
 import pytest
 
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-payout-lab.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-sprint.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
 FOUNDER_EMAIL = "founder@audinexa.com"

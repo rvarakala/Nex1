@@ -5,7 +5,7 @@ import pytest
 import requests
 
 from _helpers import ADMIN_EMAIL, ADMIN_PASSWORD  # legacy creds (env-overridable)
-BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-payout-lab.preview.emergentagent.com").rstrip("/")
+BASE_URL = os.environ.get("REACT_APP_BACKEND_URL", "https://referral-sprint.preview.emergentagent.com").rstrip("/")
 API = f"{BASE_URL}/api"
 
 session = requests.Session()
