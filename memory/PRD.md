@@ -1,6 +1,81 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-009 — FORMALLY CLOSED (2026-08-19)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview regression, manual Production deployment, and read-only Production post-deployment verification.
+
+**Title**: NAV-009 — Payments & Refunds Hardening · Phase 2A
+**Production status**: DEPLOYED AND POST-DEPLOYMENT VERIFIED
+**Final verification status**: 🟡 PASS WITH OBSERVATION — application/public-surface behaviour directly verified on Production via strictly read-only unauthenticated probes; financial data-plane behaviour NOT directly exercised on Production (zero authenticated financial transactions performed) and is supported by Preview 182/182 regression, deployed-code identity, and the established "Preview represents Production unless contrary evidence" project convention. This limitation is documented, NOT a NAV-009 implementation failure.
+
+**Sprint approved scope (Phase 2A · 6 findings)**:
+- **NAV009-PAY-001** (P0) — HA/payment dual-write behaviour: unified all four HA payment paths (Quick Sale create + mark-balance-paid, Custom HA Order create, Ear-Mould create) onto a canonical writer that maintains parity between `invoices.payments[]` and `db.payments`.
+- **NAV009-PAY-002** (P1) — payment RBAC protection: `POST /api/billing/invoices/{id}/payments` now gated by `require_roles(front_desk, accounts, clinic_owner)` (super_admin / founder bypass), matching the refund gate exactly.
+- **NAV009-PAY-003** (P1) — overpayment protection: server-side reject when `payload.amount > current due_total + MONEY_TOL`, enforced atomically inside a MongoDB aggregation-pipeline `find_one_and_update`.
+- **NAV009-PAY-004** (P1) — concurrent payment safety: atomic pipeline update with `$concatArrays` + `$add` closes the read-modify-write lost-update race; no embedded payment row can be silently dropped.
+- **NAV009-REF-001** (P1) — concurrent refund safety: atomic pipeline update guarded by `$expr: paid_total >= amount - MONEY_TOL`; only one concurrent refund can consume a given refundable ceiling.
+- **NAV009-PAY-005** (P1) — patient-portal outstanding calculation: `me_invoices` now projects and sums the real `due_total` field (was `balance_due`, which never existed) and excludes only `{cancelled, refunded}` (was filtering on invalid status `"issued"`). `total_outstanding` now reflects true patient balance.
+- **PAY-006 scope-correction (REVERT)**: `record_payment_atomic` restored to the pre-NAV-009 behaviour where only `cancelled` blocks new payments. The original PAY-006 finding (also blocking `refunded` / `partially_refunded`) was P2 and out-of-scope for Phase 2A; the block was removed to prevent a silent user-facing behaviour change. This is a scope correction, NOT a newly implemented product decision. A future product decision on payments after refunds remains open.
+
+**Files changed (final, post-scope-correction)**:
+- `backend/billing.py` — added `MONEY_TOL`, `_PAYMENT_ROLES`, `_new_payment_id`, `_due_expr_field`, `_status_expr`, `record_payment_atomic`, `record_refund_atomic`, `mirror_embedded_payments_to_top_level`; rewrote `add_payment` and `refund_invoice` to delegate to the atomic helpers.
+- `backend/routers/ha_quick_sale.py` — post-invoice-insert mirror in `create_quick_sale`; `mark_balance_paid` rewritten to use `record_payment_atomic`.
+- `backend/routers/ha_custom_ha_orders.py` — post-invoice-insert mirror.
+- `backend/routers/ha_ear_moulds.py` — post-invoice-insert mirror.
+- `backend/routers/patient_portal.py` — `me_invoices` field/status correction.
+- `backend/tests/test_nav009_payments_refunds.py` **NEW · 20 tests** — full regression covering every approved finding + PAY-006 revert + historical-duplicate safety guardrail.
+
+**Regression results (final)**:
+- NAV-005 = **47/47 PASS**
+- NAV-006 = **64/64 PASS**
+- NAV-007 = **22/22 PASS**
+- NAV-008 = **29/29 PASS**
+- NAV-009 = **20/20 PASS**
+- **Combined = 182/182 PASS**
+- Pre-existing / batch-order flakes documented, NOT hidden or altered: `test_billing_refunds.py` hardcoded-phone collisions (reproducible on baseline `0a9387f`), `test_sale_invoice_prefill.py` demo-seed absence, `test_nav005_sprint3b::test_follow_001_...` order flake, `test_billing_catalog_invariant.py` + `test_service_invoice_gst.py` explicit demo-seed skips, and two batch-order/login-rate-limit flakes on `test_nav006_p1b::test_B1_2_...` and `test_nav009::test_pay002_add_payment_forbidden_for_audiologist_role` (both pass in isolation).
+
+**Production post-deployment verification (unauthenticated, read-only)**:
+- `GET /api/health` → 200 healthy.
+- `GET /` (SPA) → 200 · `<title>AUDINEXA — Audiology Clinic OS</title>`.
+- **27 unauthenticated verification probes completed**; all NAV-009 protected routes returned 401.
+- NAV-005 / NAV-006 / NAV-007 authentication / routing surfaces intact.
+- NAV-008 invoice surface intact.
+- **Zero unexpected 4xx / 5xx**; zero 502 / 503 / 504.
+- Sanity control `GET /api/definitely-nonexistent-route` → 404, confirming 401s above are auth-gate hits not path-not-found masquerades.
+
+**Production data safety (this closure + the entire NAV-009 verification cycle)**:
+- Zero authenticated Production requests.
+- Zero Production writes / invoice creation / payment creation / refund creation / patient creation / appointment creation / session creation.
+- Zero invoice / payment / refund modification.
+- Zero deletion of any kind.
+- Zero migrations executed.
+- Zero counter reconciliation.
+
+**Historical data safety**:
+- Historical invoices NOT modified.
+- Historical payments NOT modified.
+- No invoice renumbered / deleted / merged.
+- No refund backfill executed.
+- No orphan-payment cleanup executed.
+- NAV-008 counter reconciliation remains DEFERRED and was NOT executed.
+- `tenant-sound-clinic-blr / INV/2026/000004` NOT touched.
+
+**Deferred risks (backlog · NOT NAV-009 closure blockers · DO NOT implement without explicit authorization)**:
+1. Payment/refund request idempotency — no `Idempotency-Key` mechanism; client double-submit can create duplicate financial rows.
+2. Compensating-delete failure / ghost `db.payments` row scenario (CASE D).
+3. HA mirror transient failure / retry strategy (CASE E).
+4. Historical orphan-payment cleanup/backfill (Preview shows 82 pre-existing orphans on `tenant-sound-clinic-blr` + `BR-CL-4601C9DF`; all pre-date NAV-009; untouched).
+5. Future product decision on payment eligibility for `refunded` / `partially_refunded` invoices (original PAY-006).
+
+**Production verification limitation** (recorded, NOT a closure blocker):
+Direct Production `db.invoices.getIndexes()`, `db.payments` orphan count, and commit SHA cannot be independently observed from this agent. No public `/api/health/build`, `/api/version`, `/api/commit`, or `/api/health/version` endpoint exists. Under the established "Preview represents Production unless contrary evidence" convention and given that all 27 public-surface probes returned expected codes, no contrary evidence has been discovered.
+
+**NAV-008 status**: 🟢 CLOSED · not reopened by NAV-009. Existing Production DB introspection limitation remains documented. Counter reconciler stays DEFERRED and was NOT executed.
+
+**No further NAV-009 work planned. Phase 2B not started. NAV-010 / Vestibular / WhatsApp/MSG91 / Referral Payout hardening / Idempotency / Orphan cleanup / Historical invoice cleanup all NOT STARTED — each requires explicit future authorization from the user.**
+
+
 ## 🏁 NAV-008 — FORMALLY CLOSED (2026-08-19)
 
 **Status**: 🟢 CLOSED · signed off by user after production public-surface verification and preview index observation.
