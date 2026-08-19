@@ -371,12 +371,22 @@ async def me_invoices(request: Request, db=Depends(get_db)):
     rows = await db.invoices.find(
         {"patient_id": p["patient_id"], "clinic_id": p["clinic_id"]},
         {"_id": 0, "invoice_id": 1, "invoice_no": 1, "invoice_date": 1,
-         "status": 1, "grand_total": 1, "total": 1, "balance_due": 1},
+         "status": 1, "grand_total": 1, "rounded_total": 1,
+         "paid_total": 1, "due_total": 1},
     ).sort("invoice_date", -1).to_list(50)
+    # NAV-009 · PAY-005 — the patient's outstanding balance is the
+    # sum of `due_total` across every invoice that still owes money.
+    # Prior code read `balance_due` (never populated) and filtered on
+    # `status == "issued"` (not a valid Invoice status), so the value
+    # was always 0.0. Correct approach: use `due_total`, and skip
+    # only the terminal / already-settled statuses.
+    _EXCLUDE = {"cancelled", "refunded"}
     total_due = 0.0
     for r in rows:
-        if r.get("status") in ("issued", "partial"):
-            total_due += float(r.get("balance_due") or 0)
+        st = (r.get("status") or "").lower()
+        if st in _EXCLUDE:
+            continue
+        total_due += float(r.get("due_total") or 0)
     return {
         "invoices": [deserialize_datetime(r) for r in rows],
         "total_outstanding": round(total_due, 2),

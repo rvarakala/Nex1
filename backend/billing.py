@@ -11,7 +11,12 @@ from fastapi import APIRouter, Depends, HTTPException
 from typing import List, Literal, Optional
 from datetime import datetime, timezone
 import logging
+import math
 import re
+import uuid
+
+from pymongo import ReturnDocument
+from pymongo.errors import DuplicateKeyError
 
 from utils.ist import IST  # noqa: F401
 
@@ -24,9 +29,20 @@ from models import (
     ReportDelivery,
     INVOICE_STATUSES,
 )
-from auth import get_current_user
+from auth import get_current_user, require_roles
 
 billing_router = APIRouter(prefix="/api")
+
+# NAV-009 · Standardised monetary tolerance for float rounding & comparisons.
+# Used by every payment/refund guard so the same 1-paisa window applies at
+# the API layer and the atomic MongoDB conditional-update layer.
+MONEY_TOL = 0.01
+
+# NAV-009 · Roles allowed to CAPTURE PATIENT PAYMENTS on the canonical
+# billing endpoint. Mirrors the refund gate exactly so that the two flows
+# can never diverge silently. `super_admin` / `founder` bypass via the
+# `require_roles` helper (see auth.require_roles).
+_PAYMENT_ROLES = ("front_desk", "accounts", "clinic_owner")
 
 
 # --------------- helpers ---------------
@@ -164,6 +180,386 @@ async def _insert_invoice_with_retry(db, inv_doc: dict, clinic_id: str, max_atte
             )
     # Unreachable — either return or raise inside the loop.
     raise HTTPException(status_code=500, detail="Invoice insert failed unexpectedly.")
+
+
+# ──────────────────────────────────────────────────────────────────────
+# NAV-009 · Atomic payment / refund writers (dual-write consistent + safe
+# under concurrency).
+# ──────────────────────────────────────────────────────────────────────
+# Design summary
+# --------------
+# Prior to NAV-009 every payment/refund writer used a read-modify-write
+# pattern on the invoice document — read invoice, build a new payments
+# array in Python, `$set` it back. Two problems:
+#   1. Full-array `$set` overwrites concurrent writes → lost-update race.
+#   2. HA workflows (ha_quick_sale, ha_custom_ha_orders, ha_ear_moulds)
+#      only pushed to `invoices.payments` and skipped `db.payments`,
+#      producing top-level revenue drift (~20 orphan rows on Preview).
+#
+# The two helpers below unify all payment/refund capture flows onto:
+#   * A single insert into the top-level `db.payments` collection.
+#   * A single **atomic** aggregation-pipeline update on the invoice
+#     with an `$expr` guard that enforces the overpayment / refundable
+#     ceiling AT THE DATABASE LAYER, not in Python. This closes the
+#     PAY-003 (overpayment), PAY-004 (payment race) and REF-001
+#     (refund race) findings in one shot.
+#
+# On MongoDB standalone (Preview), multi-document transactions are not
+# available, so we use an insert-first + compensating-delete pattern:
+#   1. Insert `db.payments` row (unique payment_id).
+#   2. Attempt atomic conditional `find_one_and_update` on the invoice.
+#   3. If matched → return; the two stores are consistent.
+#   4. If not matched → `db.payments.delete_one(payment_id)`, then
+#      diagnose (cancelled / missing / overpayment / no-refundable) and
+#      raise the correct 4xx.
+#
+# The <1 ms window between (1) and (2) is acceptable — a listing that
+# reads `db.payments` in that window sees a real payment that will be
+# committed to the invoice within the next atomic op. The reverse order
+# would produce the PAY-001 drift we are fixing.
+
+def _new_payment_id() -> str:
+    return f"PAY-{uuid.uuid4().hex[:8].upper()}"
+
+
+def _due_expr_field():
+    """Aggregation-pipeline expression: prefer `rounded_total`, fall
+    back to `grand_total`, then 0. Used both for overpayment guards
+    and for computing due_total after the update."""
+    return {"$ifNull": ["$rounded_total", {"$ifNull": ["$grand_total", 0]}]}
+
+
+def _status_expr():
+    """Aggregation-pipeline expression that derives the refund-aware
+    invoice status from the post-update `paid_total`, `refunded_total`,
+    `due_total`. Semantically identical to `_sum_invoice`'s Python
+    ladder (kept in sync — do not diverge)."""
+    return {"$switch": {
+        "branches": [
+            {"case": {"$eq": ["$status", "cancelled"]}, "then": "cancelled"},
+            # Full refund — every rupee originally collected has been
+            # refunded, so `paid_total` has decayed to ~0 while
+            # `refunded_total` carries the historical positive display.
+            {"case": {"$and": [
+                {"$gt": [{"$ifNull": ["$refunded_total", 0]}, MONEY_TOL]},
+                {"$lte": [{"$ifNull": ["$paid_total", 0]}, MONEY_TOL]},
+            ]}, "then": "refunded"},
+            # Partial refund — some paid, some refunded, both non-zero.
+            {"case": {"$gt": [{"$ifNull": ["$refunded_total", 0]}, MONEY_TOL]},
+             "then": "partially_refunded"},
+            # Classic ladder — fully paid.
+            {"case": {"$lte": ["$due_total", MONEY_TOL]}, "then": "paid"},
+            {"case": {"$gt": [{"$ifNull": ["$paid_total", 0]}, 0]}, "then": "partial"},
+        ],
+        "default": "draft"
+    }}
+
+
+async def record_payment_atomic(
+    db,
+    *,
+    clinic_id: str,
+    invoice_id: str,
+    amount: float,
+    method: str,
+    received_by_user_id: Optional[str] = None,
+    paid_at: Optional[datetime] = None,
+    reference: Optional[str] = None,
+    notes: Optional[str] = None,
+    enforce_overpay: bool = True,
+) -> tuple[dict, dict]:
+    """Atomic payment writer used by canonical billing + all HA payment
+    capture flows. Returns (updated_invoice_dict, payment_dict).
+
+    Raises HTTPException on: non-finite / non-positive amount, missing
+    invoice, cancelled invoice, refunded invoice (no further payments),
+    or overpayment (payload > current due_total + MONEY_TOL).
+
+    Preserves the invariant `db.payments.payment_id == embedded
+    invoice.payments[].payment_id` on success.
+    """
+    amt = float(amount)
+    if not math.isfinite(amt):
+        raise HTTPException(status_code=400, detail="Payment amount must be a finite number")
+    amt = round(amt, 2)
+    if amt <= 0:
+        raise HTTPException(status_code=400, detail="Payment amount must be > 0")
+
+    now = paid_at if isinstance(paid_at, datetime) else datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+
+    payment_id = _new_payment_id()
+    pay_doc: dict = {
+        "payment_id": payment_id,
+        "clinic_id": clinic_id,
+        "invoice_id": invoice_id,
+        "kind": "payment",
+        "method": method,
+        "amount": amt,
+        "reference": reference,
+        "paid_at": now.isoformat(),
+        "received_by_user_id": received_by_user_id,
+        "notes": notes,
+    }
+
+    # 1) Insert top-level row first. UUID collision is astronomically
+    # unlikely; on the off-chance retry once with a fresh id.
+    try:
+        await db.payments.insert_one(dict(pay_doc))
+    except DuplicateKeyError:
+        pay_doc["payment_id"] = _new_payment_id()
+        payment_id = pay_doc["payment_id"]
+        await db.payments.insert_one(dict(pay_doc))
+
+    # 2) Atomic conditional invoice update.
+    match: dict = {
+        "invoice_id": invoice_id,
+        "clinic_id": clinic_id,
+        # Payments are only accepted on non-cancelled, non-refunded
+        # invoices. Product decision on `partially_refunded` deferred —
+        # for now we ALSO block `partially_refunded` to avoid an
+        # unapproved product-behaviour change; documented in the audit
+        # (finding NAV009-PAY-006 is P2, unchanged in Phase 2A).
+        "status": {"$nin": ["cancelled", "refunded", "partially_refunded"]},
+    }
+    if enforce_overpay:
+        match["$expr"] = {"$gte": [
+            {"$subtract": [_due_expr_field(), {"$ifNull": ["$paid_total", 0]}]},
+            amt - MONEY_TOL,
+        ]}
+
+    pipeline = [
+        {"$set": {
+            "payments": {"$concatArrays": [
+                {"$ifNull": ["$payments", []]},
+                [pay_doc],
+            ]},
+            "paid_total": {"$round": [
+                {"$add": [{"$ifNull": ["$paid_total", 0]}, amt]},
+                2,
+            ]},
+        }},
+        {"$set": {
+            "due_total": {"$round": [
+                {"$subtract": [_due_expr_field(), "$paid_total"]},
+                2,
+            ]},
+        }},
+        {"$set": {"status": _status_expr()}},
+    ]
+
+    updated = await db.invoices.find_one_and_update(
+        match, pipeline,
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+
+    if updated is None:
+        # Compensating rollback so the top-level row does not orphan.
+        await db.payments.delete_one({"payment_id": payment_id})
+        # Diagnose the specific failure reason for a helpful 4xx.
+        inv = await db.invoices.find_one(
+            {"invoice_id": invoice_id, "clinic_id": clinic_id},
+            {"_id": 0, "status": 1, "paid_total": 1,
+             "rounded_total": 1, "grand_total": 1},
+        )
+        if not inv:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        st = (inv.get("status") or "").lower()
+        if st == "cancelled":
+            raise HTTPException(status_code=400, detail="Cannot add payment to a cancelled invoice")
+        if st in {"refunded", "partially_refunded"}:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Cannot add payment to a {st} invoice",
+            )
+        # Overpayment path.
+        due = round(
+            float(inv.get("rounded_total") or inv.get("grand_total") or 0)
+            - float(inv.get("paid_total") or 0),
+            2,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Payment amount ₹{amt:.2f} exceeds due balance ₹{max(0.0, due):.2f}"
+            ),
+        )
+
+    return updated, pay_doc
+
+
+async def record_refund_atomic(
+    db,
+    *,
+    clinic_id: str,
+    invoice_id: str,
+    amount: float,
+    method: str,
+    reason: str,
+    received_by_user_id: Optional[str] = None,
+    reference: Optional[str] = None,
+    notes: Optional[str] = None,
+) -> tuple[dict, dict]:
+    """Atomic refund writer. `amount` is the POSITIVE refund value;
+    stored on the row as a NEGATIVE amount so `_sum_invoice`'s
+    `sum(payments.amount)` naturally reduces `paid_total`.
+
+    Raises HTTPException on: non-finite / non-positive amount, missing
+    invoice, cancelled / draft invoice, no positive balance, or refund
+    exceeding the refundable ceiling.
+
+    Uses an aggregation-pipeline `find_one_and_update` guarded by
+    `$expr: paid_total >= amount - MONEY_TOL` so two concurrent refund
+    attempts on the same ceiling cannot both succeed — closes REF-001.
+    """
+    amt_pos = float(amount)
+    if not math.isfinite(amt_pos):
+        raise HTTPException(status_code=400, detail="Refund amount must be a finite number")
+    amt_pos = round(amt_pos, 2)
+    if amt_pos <= 0:
+        raise HTTPException(status_code=400, detail="Refund amount must be > 0")
+
+    now = datetime.now(timezone.utc)
+    payment_id = _new_payment_id()
+    refund_doc: dict = {
+        "payment_id": payment_id,
+        "clinic_id": clinic_id,
+        "invoice_id": invoice_id,
+        "kind": "refund",
+        "method": method,
+        # Stored NEGATIVE by convention (see Payment.kind docstring).
+        "amount": -amt_pos,
+        "reference": reference,
+        "reason": reason,
+        "paid_at": now.isoformat(),
+        "received_by_user_id": received_by_user_id,
+        "notes": notes,
+    }
+    try:
+        await db.payments.insert_one(dict(refund_doc))
+    except DuplicateKeyError:
+        refund_doc["payment_id"] = _new_payment_id()
+        payment_id = refund_doc["payment_id"]
+        await db.payments.insert_one(dict(refund_doc))
+
+    match: dict = {
+        "invoice_id": invoice_id,
+        "clinic_id": clinic_id,
+        "status": {"$nin": ["cancelled", "draft"]},
+        # Atomic refundable-ceiling guard — see REF-001 in the audit.
+        "$expr": {"$gte": [{"$ifNull": ["$paid_total", 0]}, amt_pos - MONEY_TOL]},
+    }
+    pipeline = [
+        {"$set": {
+            "payments": {"$concatArrays": [
+                {"$ifNull": ["$payments", []]},
+                [refund_doc],
+            ]},
+            "paid_total": {"$round": [
+                {"$subtract": [{"$ifNull": ["$paid_total", 0]}, amt_pos]},
+                2,
+            ]},
+            "refunded_total": {"$round": [
+                {"$add": [{"$ifNull": ["$refunded_total", 0]}, amt_pos]},
+                2,
+            ]},
+        }},
+        {"$set": {
+            "due_total": {"$round": [
+                {"$subtract": [_due_expr_field(), "$paid_total"]},
+                2,
+            ]},
+        }},
+        {"$set": {"status": _status_expr()}},
+    ]
+    updated = await db.invoices.find_one_and_update(
+        match, pipeline,
+        projection={"_id": 0},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        await db.payments.delete_one({"payment_id": payment_id})
+        inv = await db.invoices.find_one(
+            {"invoice_id": invoice_id, "clinic_id": clinic_id},
+            {"_id": 0, "status": 1, "paid_total": 1},
+        )
+        if not inv:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+        st = (inv.get("status") or "").lower()
+        if st == "cancelled":
+            raise HTTPException(status_code=400, detail="Cannot refund a cancelled invoice")
+        if st == "draft":
+            raise HTTPException(
+                status_code=400,
+                detail="Nothing to refund — this invoice has no payments yet",
+            )
+        paid_now = round(float(inv.get("paid_total") or 0), 2)
+        if paid_now <= MONEY_TOL:
+            raise HTTPException(status_code=400, detail="This invoice has no positive balance to refund")
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Refund amount ₹{amt_pos:.2f} exceeds refundable balance ₹{paid_now:.2f}"
+            ),
+        )
+    return updated, refund_doc
+
+
+async def mirror_embedded_payments_to_top_level(
+    db, invoice_doc: dict, *, actor_context: str = "",
+) -> int:
+    """NAV-009 · Best-effort mirror of an invoice's *just-inserted*
+    embedded `payments[]` array into the top-level `db.payments`
+    collection. Used by HA workflows that build the invoice + its
+    initial payment(s) in a single doc (Quick Sale create, Custom HA
+    Order create, Ear-Mould Order create).
+
+    Idempotent: skips any embedded row whose `payment_id` already
+    exists top-level. Never raises — a mirror failure is logged but
+    does not undo the invoice.
+    """
+    rows = invoice_doc.get("payments") or []
+    if not rows:
+        return 0
+    mirrored = 0
+    for row in rows:
+        pid = row.get("payment_id")
+        if not pid:
+            continue
+        # Idempotency guard — if this payment_id is already at top
+        # level (e.g. a caller already inserted via record_payment_
+        # atomic), skip silently.
+        existing = await db.payments.find_one({"payment_id": pid}, {"_id": 0, "payment_id": 1})
+        if existing:
+            continue
+        mirror_row = dict(row)
+        # Enforce top-level shape parity — the embedded row is
+        # allowed to omit clinic_id / invoice_id (legacy tolerance),
+        # but the top-level row MUST carry both for tenant queries.
+        mirror_row.setdefault("clinic_id", invoice_doc.get("clinic_id"))
+        mirror_row.setdefault("invoice_id", invoice_doc.get("invoice_id"))
+        mirror_row.setdefault("kind", "payment")
+        # Timezone hygiene — top-level should always be ISO string.
+        pa = mirror_row.get("paid_at")
+        if isinstance(pa, datetime):
+            mirror_row["paid_at"] = pa.isoformat() if pa.tzinfo else pa.replace(tzinfo=timezone.utc).isoformat()
+        try:
+            await db.payments.insert_one(mirror_row)
+            mirrored += 1
+        except DuplicateKeyError:
+            # Rare — another writer got there first. Not fatal.
+            continue
+        except Exception as exc:  # noqa: BLE001 — defensive
+            logging.getLogger(__name__).warning(
+                f"NAV-009 · mirror_embedded_payments failed for "
+                f"payment_id={pid!r} invoice_id={invoice_doc.get('invoice_id')!r} "
+                f"actor_context={actor_context!r}: {exc}",
+            )
+    return mirrored
+
+
 
 
 def _compute_line(line_in: InvoiceLineCreate, service: Optional[dict]) -> InvoiceLine:
@@ -649,44 +1045,42 @@ async def get_invoice(invoice_id: str,
 
 @billing_router.post("/billing/invoices/{invoice_id}/payments", response_model=Invoice)
 async def add_payment(invoice_id: str, payload: PaymentCreate,
-                      user=Depends(get_current_user), db=Depends(get_db)):
-    inv_doc = await db.invoices.find_one({"invoice_id": invoice_id, "clinic_id": user["clinic_id"]}, {"_id": 0})
-    if not inv_doc:
-        raise HTTPException(status_code=404, detail="Invoice not found")
-    if inv_doc.get("status") == "cancelled":
-        raise HTTPException(status_code=400, detail="Cannot add payment to a cancelled invoice")
-    if payload.amount <= 0:
-        raise HTTPException(status_code=400, detail="Payment amount must be > 0")
+                      user=Depends(require_roles(*_PAYMENT_ROLES)),
+                      db=Depends(get_db)):
+    """NAV-009 · Capture a patient payment against an invoice.
 
-    pay = Payment(
+    Concurrency & correctness: delegates to `record_payment_atomic`
+    which enforces overpayment guard, tenant match and cancelled /
+    refunded status blocks AT THE DATABASE LAYER via an aggregation-
+    pipeline `find_one_and_update`. See helper docstring for the full
+    design. Every payment written on this route lands in BOTH
+    `db.payments` (for `/billing/payments` + `/billing/collections`
+    KPIs) and `invoices.payments[]` (for InvoiceDetail rendering).
+    """
+    # Snapshot pre-write status for the auto-flip side-effect gate
+    # below (mark_sale_paid_internal + accessory stock decrement).
+    prev = await db.invoices.find_one(
+        {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
+        {"_id": 0, "status": 1, "linked_sale_no": 1, "invoice_no": 1},
+    )
+    was_paid_before = bool(prev and prev.get("status") == "paid")
+    linked_sale_no = prev.get("linked_sale_no") if prev else None
+
+    updated_doc, _pay = await record_payment_atomic(
+        db,
         clinic_id=user["clinic_id"],
         invoice_id=invoice_id,
-        method=payload.method,
         amount=float(payload.amount),
+        method=payload.method,
+        received_by_user_id=user["user_id"],
         reference=payload.reference,
         notes=payload.notes,
-        received_by_user_id=user["user_id"],
+        enforce_overpay=True,
     )
-    await db.payments.insert_one(_serialize(pay.model_dump()))
-
-    inv = Invoice(**_deserialize(inv_doc))
-    inv.payments.append(pay)
-    _sum_invoice(inv)
-
-    await db.invoices.update_one(
-        {"invoice_id": invoice_id},
-        {"$set": _serialize({
-            "payments": [p.model_dump() for p in inv.payments],
-            "paid_total": inv.paid_total,
-            "due_total": inv.due_total,
-            "status": inv.status,
-        })},
-    )
+    inv = Invoice(**_deserialize(updated_doc))
 
     # Auto-flip linked HA sale → paid (P2 Quote→Sale→Invoice→Paid one-click)
     # Trigger only on the transition to fully-paid; idempotent if already paid.
-    was_paid_before = (inv_doc.get("status") == "paid")
-    linked_sale_no = inv.linked_sale_no or inv_doc.get("linked_sale_no")
     if inv.status == "paid" and not was_paid_before and linked_sale_no:
         try:
             from routers.ha_sales import mark_sale_paid_internal
@@ -737,57 +1131,29 @@ async def refund_invoice(invoice_id: str, payload: RefundCreate,
     if user.get("role") not in {"clinic_owner", "accounts", "front_desk", "super_admin", "founder"}:
         raise HTTPException(status_code=403, detail="You don't have permission to issue refunds")
 
-    inv_doc = await db.invoices.find_one({"invoice_id": invoice_id, "clinic_id": user["clinic_id"]}, {"_id": 0})
-    if not inv_doc:
+    # NAV-009 · REF-001 — delegate to atomic writer. Pre-flight
+    # existence check kept to preserve historical 404 payload shape
+    # (record_refund_atomic returns 404 too, but this way any future
+    # divergence stays localised).
+    exists = await db.invoices.find_one(
+        {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
+        {"_id": 0, "invoice_id": 1},
+    )
+    if not exists:
         raise HTTPException(status_code=404, detail="Invoice not found")
 
-    status_now = (inv_doc.get("status") or "").lower()
-    if status_now == "cancelled":
-        raise HTTPException(status_code=400, detail="Cannot refund a cancelled invoice")
-    if status_now == "draft":
-        raise HTTPException(status_code=400, detail="Nothing to refund — this invoice has no payments yet")
-
-    # Refundable ceiling = current paid_total (which already accounts for
-    # any earlier refunds since they're negative rows). Guards against
-    # accidental over-refunding.
-    paid_now = float(inv_doc.get("paid_total") or 0)
-    if paid_now <= 0.01:
-        raise HTTPException(status_code=400, detail="This invoice has no positive balance to refund")
-    if payload.amount > paid_now + 0.01:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Refund amount ₹{payload.amount:.2f} exceeds refundable balance ₹{paid_now:.2f}",
-        )
-
-    refund_row = Payment(
+    updated_doc, _refund = await record_refund_atomic(
+        db,
         clinic_id=user["clinic_id"],
         invoice_id=invoice_id,
-        kind="refund",
+        amount=float(payload.amount),
         method=payload.method,
-        # Stored as a NEGATIVE amount — see Payment.kind docstring.
-        amount=-round(float(payload.amount), 2),
-        reference=payload.reference,
         reason=payload.reason,
+        reference=payload.reference,
         notes=payload.notes,
         received_by_user_id=user["user_id"],
     )
-    await db.payments.insert_one(_serialize(refund_row.model_dump()))
-
-    inv = Invoice(**_deserialize(inv_doc))
-    inv.payments.append(refund_row)
-    _sum_invoice(inv)
-
-    await db.invoices.update_one(
-        {"invoice_id": invoice_id},
-        {"$set": _serialize({
-            "payments": [p.model_dump() for p in inv.payments],
-            "paid_total": inv.paid_total,
-            "refunded_total": inv.refunded_total,
-            "due_total": inv.due_total,
-            "status": inv.status,
-        })},
-    )
-    return inv
+    return Invoice(**_deserialize(updated_doc))
 
 
 # --------------- CONSOLIDATED PAYMENTS + REFUNDS LISTING ---------------

@@ -333,6 +333,13 @@ async def create_custom_ha_order(
     # (order back-link + response) sees the final canonical number.
     invoice_no = invoice_doc["invoice_no"]
 
+    # NAV-009 · PAY-001 — mirror the initial-advance embedded payment
+    # (if any) into `db.payments` so revenue KPIs no longer miss it.
+    from billing import mirror_embedded_payments_to_top_level
+    await mirror_embedded_payments_to_top_level(
+        db, invoice_doc, actor_context=f"ha_custom_ha_orders.create/{order_id}",
+    )
+
     # ── Order doc ──
     order_doc = {
         "order_id": order_id,

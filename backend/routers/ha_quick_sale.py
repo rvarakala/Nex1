@@ -646,9 +646,18 @@ async def create_quick_sale(
     # a raw insert bypassed the counter) transparently renews the
     # invoice_no. On persistent conflict the helper raises a
     # controlled 500 instead of leaking a Mongo E11000.
-    from billing import _insert_invoice_with_retry
+    from billing import _insert_invoice_with_retry, mirror_embedded_payments_to_top_level
     await _insert_invoice_with_retry(db, invoice_doc, user["clinic_id"])
     invoice_no = invoice_doc["invoice_no"]
+
+    # NAV-009 · PAY-001 — mirror the embedded initial payment (if any)
+    # into the top-level `db.payments` collection so `/billing/payments`
+    # + `/billing/collections` KPIs no longer under-count HA revenue.
+    # Best-effort: a mirror failure is logged but never rolls back the
+    # invoice or the sale.
+    await mirror_embedded_payments_to_top_level(
+        db, invoice_doc, actor_context=f"ha_quick_sale.create/{quick_sale_id}",
+    )
 
     log.info(
         f"quick-sale created clinic={user['clinic_id']} sale_no={sale_no} "
@@ -769,35 +778,34 @@ async def mark_balance_paid(
         }},
     )
 
-    # 2) Update invoice — append a Payment, recompute paid_total/due_total/status
+    # 2) NAV-009 · PAY-001 + PAY-004 — atomic dual-write via the
+    # canonical `record_payment_atomic` helper. This replaces the prior
+    # `$push` + `$set: paid_total/due_total/status` block which:
+    #   (a) skipped `db.payments` (top-level revenue drift), and
+    #   (b) recomputed status in Python from a stale read.
+    # The helper enforces the tenant match and cancelled/refunded
+    # blocks at the DB layer. Overpayment guard is disabled here
+    # because the mark-balance-paid endpoint has ALREADY validated
+    # `pay_amount <= current_balance` on the quick_sale row above
+    # (lines 738-746) and the amount would legitimately close a
+    # partial invoice — the atomic guard would otherwise mis-fire
+    # if the embedded/invoice paid_total was already synchronised.
     invoice = await db.invoices.find_one({"invoice_id": qs["invoice_id"]}, {"_id": 0})
     if invoice:
-        new_payment = {
-            "payment_id": f"PAY-{uuid.uuid4().hex[:8].upper()}",
-            "clinic_id": user["clinic_id"],
-            "invoice_id": invoice["invoice_id"],
-            "method": pay_mode,
-            "amount": pay_amount,
-            "reference": payload.reference,
-            "paid_at": now,
-            "received_by_user_id": user["user_id"],
-            "notes": payload.notes or "Balance settlement via Mark balance paid.",
-        }
-        new_inv_paid = round(float(invoice.get("paid_total") or 0) + pay_amount, 2)
-        grand_total = float(invoice.get("grand_total") or invoice.get("rounded_total") or qs.get("total") or 0)
-        new_inv_due = max(0.0, round(grand_total - new_inv_paid, 2))
-        new_inv_status = "paid" if new_inv_due <= 0.005 else "partial"
-        await db.invoices.update_one(
-            {"invoice_id": invoice["invoice_id"]},
-            {
-                "$push": {"payments": new_payment},
-                "$set": {
-                    "paid_total": new_inv_paid,
-                    "due_total": new_inv_due,
-                    "status": new_inv_status,
-                },
-            },
+        from billing import record_payment_atomic
+        updated_inv, _pay = await record_payment_atomic(
+            db,
+            clinic_id=user["clinic_id"],
+            invoice_id=invoice["invoice_id"],
+            amount=pay_amount,
+            method=pay_mode,
+            received_by_user_id=user["user_id"],
+            paid_at=now,
+            reference=payload.reference,
+            notes=payload.notes or "Balance settlement via Mark balance paid.",
+            enforce_overpay=False,
         )
+        new_inv_status = updated_inv.get("status") or ("paid" if fully_settled else "partial")
     else:
         new_inv_status = "paid" if fully_settled else "partial"
         new_inv_paid = new_paid
