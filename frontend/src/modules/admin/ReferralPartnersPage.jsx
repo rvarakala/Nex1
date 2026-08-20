@@ -206,7 +206,13 @@ const PartnerStatsDrawer = ({ partner, onClose }) => {
 
           <div className="flex items-center justify-between">
             <h3 className="text-sm font-bold text-slate-700">Payout history</h3>
-            <button onClick={() => setShowPayout(true)} className="text-xs font-semibold text-indigo-700 hover:underline" data-testid="partner-new-payout-btn">+ Create payout</button>
+            <button
+              type="button"
+              onClick={() => !showPayout && setShowPayout(true)}
+              disabled={busy || showPayout}
+              className="text-xs font-semibold text-indigo-700 hover:underline disabled:opacity-50 disabled:cursor-not-allowed"
+              data-testid="partner-new-payout-btn"
+            >+ Create payout</button>
           </div>
           <table className="w-full text-xs border border-slate-200 rounded">
             <thead className="bg-slate-50 text-[10px] uppercase tracking-wider text-slate-500">

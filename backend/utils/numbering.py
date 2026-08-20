@@ -30,6 +30,8 @@ _FORMATS: dict[str, tuple[str, int]] = {
     "approval": ("APR",  4),
     "amc":      ("AMC",  4),
     "payout":   ("PAY",  4),
+    "recovery": ("REC",  4),
+    "referral_event": ("REVT", 4),
 }
 
 

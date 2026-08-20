@@ -167,11 +167,21 @@ async def _dashboard_rows(db, clinic_id: str, start_dt: datetime, end_dt: dateti
     #    doctors. We use referring_doctor_id (the canonical FK) — the
     #    free-text `referring_physician` field is ignored on purpose
     #    because it can't be reliably matched to a doctor record.
+    #
+    # NAV-011 · Bundle 2 · Partner > Doctor precedence
+    # ------------------------------------------------
+    # If a patient ALSO has `referral_partner_id` set, the external
+    # partner earns the commission (Decision #5). We exclude such
+    # patients from the doctor rollup so no invoice can pay commission
+    # twice on the same underlying revenue.
     patient_to_doctor: dict[str, str] = {}
     async for p in db.patients.find(
         {"clinic_id": clinic_id, "referring_doctor_id": {"$in": list(doctors.keys()) or [None]}},
-        {"_id": 0, "patient_id": 1, "referring_doctor_id": 1},
+        {"_id": 0, "patient_id": 1, "referring_doctor_id": 1, "referral_partner_id": 1},
     ):
+        # Partner-exclusivity gate — patient owed to partner, not doctor.
+        if p.get("referral_partner_id"):
+            continue
         did = p.get("referring_doctor_id")
         pid = p.get("patient_id")
         if did and pid and did in doctors:
@@ -184,26 +194,31 @@ async def _dashboard_rows(db, clinic_id: str, start_dt: datetime, end_dt: dateti
     # crashed /referrals/dashboard with `KeyError: 'diagnostics_payout'`
     # for clinics whose referring doctors had no linked patients yet.
 
-    # 3. Pull PAID invoices in window for those patients. Split each
-    #    invoice's revenue by line `product_type` so a single mixed
-    #    invoice (PTA + HA fitting) correctly contributes to both totals.
+    # 3. Pull invoices in window for those patients, applying the
+    #    NAV-011 canonical revenue formula.
     #
-    #    Reliability note (2026-07-31): historical invoices raised through
-    #    `POST /api/appointments/with-invoice` didn't carry `product_type`
-    #    on their lines — the wing was stored on the appointment but not
-    #    mirrored onto the invoice lines. So we ALSO peek at the linked
-    #    appointment's `wing` field and, when it's "hearing_aid", treat
-    #    the ENTIRE invoice as HA revenue regardless of line tagging.
-    #    This heals existing production data without a migration.
+    # NAV-011 · Bundle 1 · canonical commissionable revenue
+    # -----------------------------------------------------
+    # Commissionable per invoice = max(0, paid_total − refunded_total).
+    # We include statuses {paid, partial, partially_refunded} — anything
+    # where money has been collected — and gate on net > 0. `cancelled`,
+    # `refunded`, `draft`, and `unpaid` invoices contribute 0.
+    #
+    # The per-line diag-vs-HA split remains driven by `product_type` /
+    # appointment wing. Each line's contribution is then SCALED by
+    # `net / grand_total` so the total commissionable for the invoice
+    # matches the canonical formula while preserving the bucket ratio.
     invoices_to_process: list[dict] = []
     async for inv in db.invoices.find(
         {
             "clinic_id": clinic_id,
             "patient_id": {"$in": list(patient_to_doctor.keys())},
-            "status": "paid",
+            "status": {"$in": ["paid", "partial", "partially_refunded"]},
             "invoice_date": {"$gte": start_iso, "$lte": end_iso},
         },
-        {"_id": 0, "patient_id": 1, "lines": 1, "ticket_no": 1, "session_id": 1, "grand_total": 1, "appointment_id": 1},
+        {"_id": 0, "patient_id": 1, "lines": 1, "ticket_no": 1, "session_id": 1,
+         "grand_total": 1, "rounded_total": 1, "appointment_id": 1,
+         "paid_total": 1, "refunded_total": 1, "status": 1},
     ):
         invoices_to_process.append(inv)
 
@@ -221,6 +236,25 @@ async def _dashboard_rows(db, clinic_id: str, start_dt: datetime, end_dt: dateti
         did = patient_to_doctor.get(inv.get("patient_id"))
         if not did or did not in doctors:
             continue
+
+        # NAV-011 · canonical net-collected for this invoice.
+        # NAV-009 stores refunds as NEGATIVE payment amounts, so
+        # `paid_total` is ALREADY net-of-refunds. `refunded_total` is
+        # retained as a separate audit field but NOT subtracted here
+        # (doing so would double-count).
+        #
+        # Legacy fallback: pre-NAV-009 fully-paid invoices may not carry
+        # `paid_total` — treat as `grand_total` in that case, else 0.
+        pt = inv.get("paid_total")
+        if pt is None:
+            if (inv.get("status") or "").lower() == "paid":
+                net_collected = float(inv.get("grand_total") or inv.get("rounded_total") or 0.0)
+            else:
+                net_collected = 0.0
+        else:
+            net_collected = max(0.0, float(pt))
+        if net_collected <= 0.005:
+            continue  # nothing commissionable on this invoice
 
         # If the linked appointment is on the HA wing, count the whole
         # invoice as HA revenue (heals legacy `product_type=None` rows).
@@ -245,6 +279,14 @@ async def _dashboard_rows(db, clinic_id: str, start_dt: datetime, end_dt: dateti
                 ha_rev += gt
             else:
                 diag_rev += gt
+
+        # NAV-011 · scale each bucket by (net_collected / gross) so the
+        # invoice's total contribution matches canonical net-collected.
+        gross = float(inv.get("grand_total") or inv.get("rounded_total") or 0.0)
+        if gross > 0.005:
+            scale = min(1.0, net_collected / gross)
+            diag_rev *= scale
+            ha_rev *= scale
 
         doctors[did]["diagnostics_revenue"] += diag_rev
         doctors[did]["ha_sales_revenue"] += ha_rev
