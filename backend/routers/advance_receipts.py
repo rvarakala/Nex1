@@ -341,11 +341,28 @@ async def void_advance_receipt(
     Phase 2A does NOT emit a refund — the money remains "held" in the
     clinic's books; the void just marks the acknowledgement itself as
     voided. Phase 2C will introduce controlled advance-refund flows.
+
+    NAV-011 · Phase 2B.2 · Safety-guard tightening — voiding a receipt
+    that has ANY active allocations is REJECTED with 409. The CAS `$expr`
+    treats missing / null `allocated_total` (legacy Phase 2A rows and
+    the one Phase 2B.1-transition row) as 0, so those receipts remain
+    voidable as before. Only receipts with a positive live
+    `allocated_total` are blocked. Money invariant preserved — an
+    allocated receipt cannot silently vanish.
     """
     now_iso = datetime.now(timezone.utc).isoformat()
     res = await db.advance_receipts.find_one_and_update(
-        {"receipt_id": receipt_id, "clinic_id": user["clinic_id"],
-         "status": "active"},
+        {
+            "receipt_id": receipt_id,
+            "clinic_id": user["clinic_id"],
+            "status": "active",
+            # `$ifNull` maps missing/null allocated_total → 0. MONEY_TOL
+            # gives 1-paisa float tolerance in the (theoretical) case
+            # where allocated_total drifts to a sub-paisa residue.
+            "$expr": {
+                "$lte": [{"$ifNull": ["$allocated_total", 0]}, MONEY_TOL],
+            },
+        },
         {"$set": {
             "status": "voided",
             "voided_at": now_iso,
@@ -359,15 +376,27 @@ async def void_advance_receipt(
     if not res:
         existing = await db.advance_receipts.find_one(
             {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
-            {"_id": 0, "status": 1},
+            {"_id": 0, "status": 1, "allocated_total": 1},
         )
         if not existing:
             raise HTTPException(status_code=404, detail="Advance receipt not found")
+        # Distinguish "wrong state" vs "has live allocations" for a
+        # helpful, deterministic 409 message.
+        alloc_total = round(float(existing.get("allocated_total") or 0), 2)
+        if existing.get("status") != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot void — receipt is in state {existing['status']!r} "
+                    f"(only 'active' can be voided)"
+                ),
+            )
+        # status is active but allocated_total > MONEY_TOL → blocked.
         raise HTTPException(
             status_code=409,
             detail=(
-                f"Cannot void — receipt is in state {existing['status']!r} "
-                f"(only 'active' can be voided)"
+                f"Cannot void — advance has ₹{alloc_total:.2f} in active "
+                "allocations. Void the allocation(s) first, then retry."
             ),
         )
     await _emit_audit(

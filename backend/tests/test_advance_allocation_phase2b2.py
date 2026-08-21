@@ -580,19 +580,14 @@ def test_rollback_on_cancelled_invoice_leaves_advance_intact(admin_token, accoun
 
 
 # ─────────────────────────────────────────────────────────────────────
-# 11) NON-INTERFERENCE — void of a partially-allocated advance is NOT
-#     supported by Phase 2B.2 (Phase 2B.3+); the CAS on Phase 2A's
-#     void endpoint still uses only `status: active`, so this
-#     currently succeeds. Documenting the CURRENT behaviour so it is
-#     explicitly reviewed before Phase 2B.3 tightens the CAS with
-#     `allocated_total: 0`.
+# 11) Phase 2B.2 · Safety-guard tightening — the void endpoint now
+#     REJECTS voiding an advance that has active allocations. Regression
+#     locks in the corrected behaviour.
 # ─────────────────────────────────────────────────────────────────────
 
-def test_current_behaviour_void_after_allocation_still_succeeds(admin_token, accounts_token):
-    """Phase 2B.2 does NOT tighten the advance-void CAS. This is a
-    documented gap — Phase 2B.3 (allocation void) will add
-    `allocated_total: 0` to the void CAS. This test locks in the
-    CURRENT observable behaviour so any accidental change is caught."""
+def test_void_after_partial_allocation_now_blocked_409(admin_token, accounts_token):
+    """After the Phase 2B.2 safety correction: voiding an advance with
+    a live allocation MUST fail with 409 and mutate nothing."""
     pat = _mk_patient(admin_token)
     ar = _mk_advance(admin_token, pat, amount=500)
     inv = _mk_invoice(admin_token, pat, unit_price=500)
@@ -601,8 +596,15 @@ def test_current_behaviour_void_after_allocation_still_succeeds(admin_token, acc
     v = requests.post(
         f"{API}/advance-receipts/{ar['receipt_id']}/void",
         headers=H(accounts_token),
-        json={"reason": "known-gap void after allocation"},
+        json={"reason": "should be blocked"},
         timeout=10,
     )
-    # Currently permitted. Phase 2B.3 will change this to 409.
-    assert v.status_code == 200, v.text
+    assert v.status_code == 409, v.text
+    assert "allocation" in (v.json().get("detail") or "").lower()
+    # Advance stayed active with the correct partially-allocated ledger.
+    fresh = requests.get(
+        f"{API}/advance-receipts/{ar['receipt_id']}", headers=H(admin_token), timeout=10,
+    ).json()
+    assert fresh["status"] == "active"
+    assert fresh["available_balance"] == 300.0
+    assert fresh["allocated_total"] == 200.0
