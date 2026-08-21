@@ -1,6 +1,123 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 ADVANCE ALLOCATION · PHASE 2B.3 (UX CORRECTION) · APPLY ADVANCE INLINE — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview implementation, targeted Preview regression (17/17 new inline UX tests + 134/134 full Advance-stack tests + 52/52 adjacent NAV-009/010 tests), user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification.
+
+**Title**: Advance Allocation · Phase 2B.3 (UX Correction) — Inline Apply-Advance integrated into the four patient-facing sale surfaces (Quick HA Sale, Custom HA Order, Ear Mould, Accessory / General Invoice), reusing the Phase 2B.2 allocation writer verbatim.
+
+**Final verification verdict**: **🟡 PASS WITH OBSERVATION** — preserved verbatim per user instruction. NOT upgraded to unconditional 🟢 PASS.
+
+**Approved Phase 2B.3 UX Correction scope · completed**:
+1. Shared inline component `frontend/src/modules/billing/InlineApplyAdvancePanel.jsx` — a controlled React panel that lists the current patient's active Advance Receipts with `available_balance > 0`, offers a receipt picker (dropdown if multiple, badge if single), an amount input capped at `min(available_balance, sale_price)` with a Max shortcut, a live preview (Invoice total unchanged · Advance applied · Balance to collect), and exports two helpers: `preflightAdvance()` (re-fetches the selected receipt right before submit; fail-fast if the balance drifted) and `allocateAdvance()` (POSTs to the authoritative Phase 2B.2 writer with a fresh `Idempotency-Key`).
+2. Inline integration into all four patient-facing sale surfaces — each form runs the two-step sequence (1) pre-flight, (2) POST sale endpoint (unchanged, full sale price), (3) POST allocation. On step-3 failure the invoice remains untouched (grand_total preserved, no `method="advance"` phantom payment) and an amber warning banner surfaces the exact error with a retry-via-Advance-Receipts hint:
+   - `frontend/src/modules/ha/QuickHASaleModal.jsx` — testid prefix `qha-apply-advance`.
+   - `frontend/src/modules/ha/CustomHAOrdersPage.jsx` (`CustomHAOrderModal`) — testid prefix `cha-apply-advance`.
+   - `frontend/src/modules/ha/EarMouldsPage.jsx` (`BookEarMouldModal`) — testid prefix `em-apply-advance`.
+   - `frontend/src/modules/billing/CreateInvoicePage.js` (verified via code search as the real accessory-sale / general invoice surface; `AccessoriesPage.jsx` confirmed inventory-only and NOT touched) — testid prefix `ci-apply-advance`.
+3. FastAPI query-parameter deprecation fix — `backend/routers/advance_receipts.py:267` `Query(regex=r"^(active|voided)$")` → `Query(pattern=r"^(active|voided)$")`. Twin at line 336 (`list_advance_allocations`) was already correct in the Phase 2B.3 initial delivery. `grep -rn 'Query(.*regex=' backend/routers/` returns zero remaining hits.
+4. Targeted regression suite — `backend/tests/test_advance_allocation_phase2b3_ux_inline.py` (17 tests) covering:
+   - Happy paths across HA / Custom HA / Ear Mould / Accessory non-serialised / Accessory serialised (NAV-010 stock-reservation path exercised end-to-end via `accessory_product_id`, gracefully skipped when the tenant has no saleable SKU with stock).
+   - Partial advance, full advance, multi-allocation across products, ledger view agreement.
+   - Pre-flight catches drained advance (concurrent race simulation).
+   - Over-allocation (400, no phantom payment).
+   - Patient mismatch (400).
+   - Tenant mismatch (404).
+   - Concurrent apply arbitration (exactly one 200 + one 4xx via CAS).
+   - Idempotent retry (same key → `Idempotency-Replay: true`, same `allocation_id`).
+   - Front-desk RBAC on the allocation POST.
+   - **Financial invariant** — `test_inline_grand_total_never_shrinks_after_allocation` (HA ₹1,80,000 + Advance ₹50,000 → grand_total=180000, subtotal=180000, paid_total=50000, due_total=130000, exactly one `method="advance"` payment row with `advance_receipt_id` backlink).
+   - Receipt `received_amount` never mutated.
+
+**Explicitly OUT-OF-SCOPE and NOT implemented (per user directive)**:
+- No modification to the closed Phase 2B.2 writer (`allocate_advance`) — CAS, idempotency, RBAC, tenant/patient/over-allocation/concurrency guards untouched.
+- No modification to `record_payment_atomic` — NAV-009 pipeline untouched.
+- No modification to NAV-010 inventory paths — accessory stock decrement and serialised accessory reservation still run first inside `POST /billing/invoices`; the allocation POST is chained AFTER invoice creation.
+- No modification to NAV-011 (referral).
+- No new allocation/payment mechanism; the existing `POST /api/advance-receipts/{id}/allocations` remains the sole authoritative writer.
+- No PRD updates outside this single new closure block.
+- No migration, no backfill, no reconciliation, no historical cleanup, no touch of the 127 legacy Advance Receipts (including `AR-6A832F03B188`).
+- No unrelated cleanup, no refactor, no cross-endpoint transactional envelope invented.
+
+**Accepted architectural limitation (documented, safe)**:
+The sale + allocation chain is two ordered HTTP POSTs, NOT one database transaction. The implementation deliberately does NOT claim atomicity across them. Safety is preserved because (a) the pre-flight blocks invoice creation when the advance is already drained, (b) the Phase 2B.2 writer is itself atomic and commits nothing on failure, and (c) on step-2 failure the invoice EXISTS with `paid_total` unaffected — no phantom `method="advance"` payment is recorded — and the amber banner surfaces the exact error so staff can retry via the Advance Receipts screen. Verified by `test_inline_preflight_catches_drained_advance` and `test_inline_over_allocation_rejected` (both confirm zero invoice mutation on allocation failure).
+
+**Test results at closure**:
+- **New inline UX suite: 17/17 PASS** in 49.01 s.
+- **Full Advance-stack (Phase 2A + 2B.1 + 2B.2 + 2B.3 initial + 2B.3 inline UX): 134/134 PASS** in 93.47 s.
+- **Adjacent NAV-009 + NAV-010: 52/52 PASS** in 46.35 s.
+- Zero regressions attributable to the UX correction.
+
+**Production post-deployment verification (strictly zero-write / unauthenticated)**:
+- `GET https://audinexa.com/api/health` → **HTTP 200** · `{"status":"healthy","timestamp":"2026-08-21T14:59:45.058442+00:00"}`.
+- `GET https://audinexa.com/` → **HTTP 200** · SPA served · `<title>AUDINEXA — Audiology Clinic OS</title>`.
+- All protected routes (`/api/advance-receipts` list/detail/PDF, `/api/billing/invoices`, `/api/billing/payments`, `POST /api/advance-receipts/AR-…DO-NOT-USE/allocations`) → **HTTP 401** `{"detail":"Not authenticated"}`.
+- Sanity 404 control (`/api/definitely-nonexistent-route`) → **HTTP 404** — confirms the 401s are genuine auth gates.
+- NAV-009 surface (`POST /api/billing/invoices/{synthetic}/refund`) → 401.
+- NAV-010 surface (`POST /api/ha/quick-sale`, `POST /api/ha/ear-moulds`, `POST /api/ha/custom-ha-orders`, `GET /api/ha/accessory-stock`, `GET /api/ha/products`) → all 401.
+- NAV-011 surface (`GET /api/referral-partners`, `GET /api/referrals/dashboard`) → 401; `GET /api/referral-partners/summary` → 405 (POST-only surface — route present).
+- Zero unexpected 5xx.
+- Deployed frontend bundle `main.cb194cc2.js` (3.55 MB) contains: all four testid prefixes (`qha-apply-advance`, `cha-apply-advance`, `em-apply-advance`, `ci-apply-advance`), the `aa-inline-` idempotency-key prefix unique to `InlineApplyAdvancePanel`, the `Apply Advance —` header text with em-dash, the `Invoice total stays` invariant guard-text, the `could not be applied` two-step failure warning, and every financial field name (`grand_total`, `due_total`, `paid_total`, `method`, `invoice_id`, `receipt_id`, `available_balance`).
+
+**Verification limitations recorded verbatim (NOT reinterpreted as implementation failures)**:
+1. Authenticated financial business behaviour was NOT independently tested on Production because verification was strictly zero-write / unauthenticated.
+2. Production build / commit identity cannot be independently verified through public endpoints (`/api/version`, `/api/commit`, `/api/health/build`, `/api/health/version`, `/api/build` all return 404 — same posture as NAV-012, Phase 2A, and Phase 2B.2 closures). Deployment identity was corroborated indirectly via the deployed frontend bundle hash and observed signature strings.
+3. The `regex → pattern` backend correction could not be independently observed through Production because the auth middleware runs before Pydantic query-param validation (both `?status=INVALID` and no-param requests return 401 identically). Confirmed only in Preview code + 134/134 Advance-stack tests PASS.
+
+**Production data-safety (this closure)**:
+- **Authenticated Production requests = 0.**
+- **Production writes = 0.**
+- **Advance Receipts created in Production during verification = 0.**
+- **Advance Allocations created in Production during verification = 0.**
+- **Invoices created / modified in Production during verification = 0.**
+- **Payments created / modified in Production during verification = 0.**
+- **Refunds executed in Production during verification = 0.**
+- **Voids executed in Production during verification = 0.**
+- **Inventory / serial / accessory-stock modifications = 0.**
+- **Migrations / backfill / reconciliation / historical cleanup / deletions = 0.**
+- **Tenant `tenant-sound-clinic-blr`, invoice `INV/2026/000004`, historical Advance Receipts / invoices / payments / allocations / inventory / serial records — none accessed.**
+
+**Historical / data safety**:
+- No Production financial data modified.
+- No historical Advance Receipt modified.
+- No backfill.
+- No migration.
+- No reconciliation.
+- No historical cleanup.
+- No Production transaction executed during verification.
+- The 127 legacy Advance Receipts (including `AR-6A832F03B188` with null `available_balance`) remain untouched. No automatic backfill code exists in the deployed backend; no startup `update_many`, no automatic balance initialisation.
+
+**Files changed at closure**:
+```
+backend/routers/advance_receipts.py                | 2 +-      (regex→pattern, list endpoint line 267)
+frontend/src/modules/billing/CreateInvoicePage.js  | 70 +--    (Accessory / general invoice UX)
+frontend/src/modules/ha/CustomHAOrdersPage.jsx     | 64 ++     (Custom HA UX)
+frontend/src/modules/ha/EarMouldsPage.jsx          | 64 +-     (Ear Mould UX)
+frontend/src/modules/ha/QuickHASaleModal.jsx       | 81 ++     (Quick HA UX)
+frontend/src/modules/billing/InlineApplyAdvancePanel.jsx      (NEW — shared panel + preflight + allocator)
+backend/tests/test_advance_allocation_phase2b3_ux_inline.py   (NEW — 17-test targeted regression)
+```
+
+**Deferred — DO NOT IMPLEMENT (explicit, recorded)**:
+1. Advance Allocation reversal.
+2. Advance refund / reversal accounting.
+3. Allocation UI enhancements beyond the completed inline Apply Advance UX.
+4. Patient-profile allocation UI.
+5. Allocation reporting / dashboard enhancements.
+6. Historical Advance Receipt backfill.
+7. Historical Advance Receipt cleanup.
+8. Automatic reconciliation.
+9. Cross-branch allocation enhancements.
+10. Additional financial idempotency work.
+11. Advance Phase 2B.4 or later work.
+12. NAV-012 further work, NAV-013, or any unrelated financial hardening / technical debt.
+
+**Explicit statement**: No next phase has been started. Phase 2B.4 has not been started. Advance reversal has not been started. Advance refund has not been started. Patient-profile allocation UI has not been started. Allocation dashboard / reporting enhancements have not been started. Historical backfill has not been started. Historical cleanup has not been started. Any reconciliation has not been started. Cross-branch allocation enhancements have not been started. Additional idempotency work has not been started. NAV-012 further work has not been started. NAV-013 has not been started. No unrelated financial hardening or technical debt work has been started.
+
+---
+
+
 ## 🏁 ADVANCE ALLOCATION · PHASE 2B.2 — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Phase 2B.1 safety corrections, Phase 2B.2 core-writer Preview implementation, targeted Preview regression (68/68 across Phase 2B.1 + Phase 2B.2 suites), one full-suite regression pass classified for infrastructure vs code root cause, user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification.
