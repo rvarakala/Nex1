@@ -351,6 +351,28 @@ async def lifespan(_app: FastAPI):
         await db.advance_audit_events.create_index("event_id", unique=True)
         await db.advance_audit_events.create_index([("receipt_id", 1), ("at", -1)])
         await db.advance_audit_events.create_index([("clinic_id", 1), ("at", -1)])
+        # Advance Allocations · Phase 2B.2 · CORE ALLOCATION WRITER
+        # Isolated ledger for `Advance Receipt → Invoice` allocations.
+        # Every allocation row references an existing advance receipt
+        # and produces exactly one `db.payments` row via
+        # `record_payment_atomic(method="advance")`. See
+        # `/app/memory/ADVANCE_ALLOCATION_PHASE1_AUDIT.md` §4.5.
+        await db.advance_allocations.create_index(
+            [("clinic_id", 1), ("allocation_id", 1)],
+            unique=True, name="uniq_clinic_allocation_id",
+        )
+        await db.advance_allocations.create_index(
+            [("clinic_id", 1), ("allocation_no", 1)],
+            unique=True, name="uniq_clinic_allocation_no",
+        )
+        await db.advance_allocations.create_index(
+            [("clinic_id", 1), ("advance_receipt_id", 1), ("status", 1)],
+            name="aa_clinic_receipt_status",
+        )
+        await db.advance_allocations.create_index(
+            [("clinic_id", 1), ("invoice_id", 1)],
+            name="aa_clinic_invoice",
+        )
         # Patient Portal (M13, Phase 13.D)
         await db.patient_otps.create_index([("clinic_id", 1), ("patient_id", 1)], unique=True)
         await db.patient_appointment_requests.create_index("request_id", unique=True)

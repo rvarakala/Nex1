@@ -270,6 +270,7 @@ async def record_payment_atomic(
     notes: Optional[str] = None,
     enforce_overpay: bool = True,
     idempotency_correlation_id: Optional[str] = None,
+    extra_fields: Optional[dict] = None,
 ) -> tuple[dict, dict]:
     """Atomic payment writer used by canonical billing + all HA payment
     capture flows. Returns (updated_invoice_dict, payment_dict).
@@ -285,6 +286,13 @@ async def record_payment_atomic(
     ``idempotency_correlation_id`` — NAV-012.  When supplied by the
     idempotent wrapper, is stamped onto the created payment row so
     crash-recovery can detect whether this write landed.
+
+    ``extra_fields`` — NAV-011 · Phase 2B.2. Additive dict merged into
+    both the top-level `db.payments` row AND the embedded
+    ``invoice.payments[]`` entry. Used by the Advance Allocation writer
+    to stamp ``advance_receipt_id`` and ``allocation_id`` back-links.
+    Keys colliding with the base pay_doc are silently ignored to keep
+    the atomic invariant intact.
     """
     amt = float(amount)
     if not math.isfinite(amt):
@@ -312,6 +320,20 @@ async def record_payment_atomic(
     }
     if idempotency_correlation_id:
         pay_doc["idempotency_correlation_id"] = idempotency_correlation_id
+    if extra_fields:
+        # NAV-011 · Phase 2B.2 · Additive merge — MUST NOT overwrite any
+        # canonical pay_doc field (payment_id / kind / method / amount /
+        # invoice_id / clinic_id / paid_at) because those are the CAS
+        # invariants. Callers get a KeyError-free merge with the base
+        # fields preserved.
+        _RESERVED = {
+            "payment_id", "clinic_id", "invoice_id", "kind", "method",
+            "amount", "reference", "paid_at", "received_by_user_id",
+            "notes", "idempotency_correlation_id",
+        }
+        for k, v in extra_fields.items():
+            if k not in _RESERVED and v is not None:
+                pay_doc[k] = v
 
     # 1) Insert top-level row first. UUID collision is astronomically
     # unlikely; on the off-chance retry once with a fresh id.

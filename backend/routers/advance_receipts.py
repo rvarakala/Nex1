@@ -40,6 +40,8 @@ from fastapi.responses import HTMLResponse, JSONResponse
 from auth import get_current_user, require_roles
 from database import get_db
 from models._advance import (
+    AdvanceAllocation,
+    AdvanceAllocationCreate,
     AdvanceAuditEvent,
     AdvanceReceipt,
     AdvanceReceiptCreate,
@@ -49,11 +51,23 @@ from utils.idempotency import IdempotencyContext, extract_idempotency_key
 
 _log = logging.getLogger(__name__)
 
+# NAV-011 · Phase 2B.2 · imports for the allocation writer.
+# `MONEY_TOL` = 0.01 (1-paisa) — same tolerance used by
+# `record_payment_atomic` on the invoice CAS guard.
+from billing import MONEY_TOL, _deserialize, record_payment_atomic  # noqa: E402
+
+from pymongo import ReturnDocument  # noqa: E402
+
 router = APIRouter(prefix="/api/advance-receipts", tags=["advance-receipts"])
 
 CREATE_ROLES = ("front_desk", "accounts", "clinic_owner")
 READ_ROLES = ("front_desk", "accounts", "clinic_owner", "audiologist")
 VOID_ROLES = ("accounts", "clinic_owner")
+# NAV-011 · Phase 2B.2 · Allocation-writer roles — mirror the invoice
+# `add_payment` RBAC (front_desk / accounts / clinic_owner) because an
+# allocation IS a payment from a financial-integrity standpoint. Super
+# admin / founder bypass via `require_roles`.
+ALLOCATE_ROLES = ("front_desk", "accounts", "clinic_owner")
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -75,6 +89,23 @@ async def _next_advance_receipt_no(db, clinic_id: str) -> str:
     )
     seq = (res or {}).get("seq", 1)
     return f"AR/{year}/{str(seq).zfill(6)}"
+
+
+async def _next_advance_allocation_no(db, clinic_id: str) -> str:
+    """NAV-011 · Phase 2B.2 · Generate `AA/YYYY/NNNNNN` — clinic-scoped,
+    year-reset counter for the Advance Allocation ledger. Keyed on a
+    dedicated `advance_allocation:*` counter so AA / AR / INV counters
+    cannot collide.
+    """
+    year = datetime.utcnow().year
+    res = await db.counters.find_one_and_update(
+        {"_id": f"advance_allocation:{clinic_id}:{year}"},
+        {"$inc": {"seq": 1}},
+        upsert=True,
+        return_document=True,
+    )
+    seq = (res or {}).get("seq", 1)
+    return f"AA/{year}/{str(seq).zfill(6)}"
 
 
 # ─────────────────────────────────────────────────────────────────────
@@ -165,6 +196,14 @@ async def create_advance_receipt(
             )
 
         receipt_no = await _next_advance_receipt_no(db, user["clinic_id"])
+        # NAV-011 · Phase 2B.2 · New receipts are born with a live
+        # balance ledger (available_balance = received_amount,
+        # allocated_total = 0). Legacy Phase 2A receipts (127 rows at
+        # cut-over) intentionally remain with both fields = None until
+        # a separately-authorized backfill runs. The allocation endpoint
+        # rejects allocation attempts against uninitialised (None)
+        # receipts with a clear 409 so the invariant is preserved.
+        _received = float(payload.received_amount)
         receipt = AdvanceReceipt(
             receipt_no=receipt_no,
             clinic_id=user["clinic_id"],
@@ -173,7 +212,9 @@ async def create_advance_receipt(
             patient_name=pat.get("name"),
             patient_mobile=pat.get("mobile"),
             patient_mrd=pat.get("mrd"),
-            received_amount=payload.received_amount,
+            received_amount=_received,
+            available_balance=_received,
+            allocated_total=0.0,
             method=payload.method,
             reference=payload.reference,
             purpose_note=payload.purpose_note,
@@ -462,3 +503,421 @@ async def render_receipt_document(
         {"_id": 0, "name": 1, "city": 1, "state": 1, "address_line1": 1},
     ) or {}
     return HTMLResponse(content=_render_receipt_html(r, clinic))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+# NAV-011 · Phase 2B.2 · ADVANCE ALLOCATION WRITER
+# ═══════════════════════════════════════════════════════════════════════
+# Approved financial architecture:
+#     Advance Receipt
+#           ↓  (CAS decrement, single-doc atomic)
+#     Advance Allocation Ledger  (db.advance_allocations)
+#           ↓  (record_payment_atomic — proven NAV-009 pipeline)
+#     db.payments (method="advance", advance_receipt_id, allocation_id)
+#           ↓
+#     Existing invoice / revenue / GST / referral attribution stack
+#
+# Guarantees (see /app/memory/ADVANCE_ALLOCATION_PHASE1_AUDIT.md §7):
+#   I1  available_balance = received_amount − allocated_total
+#   I3  Every active allocation ⇔ exactly one payments row with
+#       method="advance", matching allocation_id.
+#   I5  SUM(advance-sourced payments on invoice) ≤ paid_total.
+#   I6  available_balance ≥ 0 (enforced by CAS $gte guard).
+#   I10 Idempotent replay = byte-identical response + zero extra money.
+#
+# NOT implemented in this phase (Phase 2B.3+):
+#   * allocation-void endpoint
+#   * refund of an unallocated advance
+#   * historical backfill of legacy receipts
+#   * UI
+
+def _invoice_snapshot(inv: dict) -> dict:
+    """Minimal invoice snapshot returned in the allocation response.
+    Deliberately projects only the fields a client needs to render the
+    "after allocation" state — full invoice reads go through the
+    existing billing endpoint.
+    """
+    if not inv:
+        return {}
+    return {
+        "invoice_id": inv.get("invoice_id"),
+        "invoice_no": inv.get("invoice_no"),
+        "status": inv.get("status"),
+        "paid_total": round(float(inv.get("paid_total") or 0), 2),
+        "due_total": round(float(inv.get("due_total") or 0), 2),
+        "refunded_total": round(float(inv.get("refunded_total") or 0), 2),
+        "grand_total": round(float(inv.get("grand_total") or 0), 2),
+        "rounded_total": round(float(inv.get("rounded_total") or 0), 2)
+                         if inv.get("rounded_total") is not None else None,
+    }
+
+
+def _advance_snapshot(receipt: dict) -> dict:
+    """Minimal advance-receipt snapshot returned in the allocation
+    response — carries the freshly-updated balance ledger."""
+    if not receipt:
+        return {}
+    return {
+        "receipt_id": receipt.get("receipt_id"),
+        "receipt_no": receipt.get("receipt_no"),
+        "status": receipt.get("status"),
+        "received_amount": round(float(receipt.get("received_amount") or 0), 2),
+        "available_balance": round(float(receipt.get("available_balance") or 0), 2),
+        "allocated_total": round(float(receipt.get("allocated_total") or 0), 2),
+    }
+
+
+@router.post("/{receipt_id}/allocations")
+async def allocate_advance(
+    receipt_id: str,
+    payload: AdvanceAllocationCreate,
+    request: Request,
+    user=Depends(require_roles(*ALLOCATE_ROLES)),
+    db=Depends(get_db),
+):
+    """Allocate an Advance Receipt against an existing invoice.
+
+    Sequence (see file-level comment for the full state diagram):
+      1. Mandatory Idempotency-Key gate.
+      2. Enter idempotency context (scope=`advance_allocation`).
+      3. Pre-flight tenant + ownership + state checks (fail fast).
+      4. Advance CAS: `$gte:amt` guard, `$inc: -amt / +amt` on the
+         receipt's balance ledger (single-doc atomic; loser sees a
+         409 with the current balance for a helpful message).
+      5. Insert `advance_allocations` ledger row (status=active,
+         payment_id=None; stamped with `idempotency_correlation_id`
+         so crash-recovery can rebuild the response).
+      6. `record_payment_atomic(method="advance", extra_fields=…)` —
+         same proven pipeline as every other invoice payment; carries
+         `advance_receipt_id` + `allocation_id` back-links on both the
+         top-level and embedded payment rows.
+      7. Update allocation with `payment_id` back-link (single-doc
+         atomic).
+      8. Append `allocated` audit event.
+      9. `idem.complete(operation_id=allocation_id)`.
+
+    Rollbacks (compensating):
+      * If step 6 fails → mark allocation `status='voided'` with
+        `void_reason='Payment write failed: <detail>'`, restore
+        advance balance via `$inc +amt / -amt`. NO physical delete —
+        the failed row remains in the ledger for audit.
+      * If step 7 fails → log critically but return success (the
+        payment is committed, the allocation is retrievable via
+        `idempotency_correlation_id`; a follow-up patch reconciles).
+
+    Body: `AdvanceAllocationCreate` (invoice_id + amount + optional note).
+    """
+    # 1) Mandatory Idempotency-Key gate.
+    raw_key = request.headers.get("Idempotency-Key") or request.headers.get("idempotency-key")
+    if raw_key is None or raw_key.strip() == "":
+        raise HTTPException(
+            status_code=400,
+            detail="Idempotency-Key header is required for advance-allocation writes.",
+        )
+    extract_idempotency_key(request)  # raises 400 on malformed
+
+    # 2) Idempotency context.
+    idem = await IdempotencyContext.enter(
+        request, db,
+        scope="advance_allocation", clinic_id=user["clinic_id"],
+        actor=user,
+        payload={"receipt_id": receipt_id, **payload.model_dump()},
+        route="/api/advance-receipts/{receipt_id}/allocations",
+        operation_collection="advance_allocations",
+    )
+    if idem.replayed:
+        body, status, headers = idem.replay_response()
+        return JSONResponse(content=body, status_code=status, headers=headers)
+
+    amount = float(payload.amount)
+
+    try:
+        # 3a) Advance receipt tenant-scoped fetch.
+        receipt = await db.advance_receipts.find_one(
+            {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0},
+        )
+        if not receipt:
+            raise HTTPException(status_code=404, detail="Advance receipt not found")
+        if receipt.get("status") != "active":
+            raise HTTPException(
+                status_code=409,
+                detail=f"Cannot allocate — advance receipt is {receipt.get('status')!r}",
+            )
+        if receipt.get("available_balance") is None:
+            # Legacy Phase 2A row — awaiting the separately-authorized
+            # backfill. Refuse to allocate rather than blindly assume
+            # `available_balance = received_amount`.
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "This advance receipt was created before Phase 2B.2 "
+                    "and its balance ledger has not been initialised yet. "
+                    "A controlled backfill is required before it can be "
+                    "allocated."
+                ),
+            )
+
+        # 3b) Invoice tenant-scoped fetch.
+        invoice = await db.invoices.find_one(
+            {"invoice_id": payload.invoice_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0},
+        )
+        if not invoice:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        # 3c) Same-patient invariant.
+        if invoice.get("patient_id") != receipt.get("patient_id"):
+            raise HTTPException(
+                status_code=400,
+                detail="Advance receipt and invoice belong to different patients",
+            )
+
+        # 3d) Invoice status guard (NAV-012 F-15).
+        inv_status = (invoice.get("status") or "").lower()
+        if inv_status in {"cancelled", "refunded", "partially_refunded"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Cannot allocate to a {inv_status!r} invoice. "
+                    "Create a fresh invoice instead."
+                ),
+            )
+
+        # 3e) Fast pre-check on invoice due_total. The final overpayment
+        # guard is enforced atomically inside `record_payment_atomic`;
+        # this pre-check just gives a clearer error before the CAS
+        # advance decrement.
+        current_due = round(
+            float(invoice.get("due_total") or 0),
+            2,
+        )
+        if current_due <= MONEY_TOL:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Invoice has no outstanding balance (due=₹{current_due:.2f})",
+            )
+        if amount > current_due + MONEY_TOL:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Allocation amount ₹{amount:.2f} exceeds invoice "
+                    f"outstanding ₹{current_due:.2f}"
+                ),
+            )
+
+        # 3f) Fast pre-check on advance available_balance. The final
+        # CAS $gte guard in step 4 is authoritative — this is just for
+        # a clearer error on the common single-request path.
+        avail = round(float(receipt.get("available_balance") or 0), 2)
+        if amount > avail + MONEY_TOL:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    f"Allocation amount ₹{amount:.2f} exceeds advance "
+                    f"available balance ₹{avail:.2f}"
+                ),
+            )
+
+        # 4) Advance CAS — the exclusive winner.
+        after_receipt = await db.advance_receipts.find_one_and_update(
+            {
+                "receipt_id": receipt_id,
+                "clinic_id": user["clinic_id"],
+                "status": "active",
+                "available_balance": {"$gte": amount - MONEY_TOL},
+            },
+            {"$inc": {
+                "available_balance": -amount,
+                "allocated_total": amount,
+            }},
+            projection={"_id": 0},
+            return_document=ReturnDocument.AFTER,
+        )
+        if not after_receipt:
+            # Diagnose why: fetch fresh state.
+            latest = await db.advance_receipts.find_one(
+                {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
+                {"_id": 0, "status": 1, "available_balance": 1},
+            )
+            if not latest:
+                raise HTTPException(status_code=404, detail="Advance receipt not found")
+            if latest.get("status") != "active":
+                raise HTTPException(
+                    status_code=409,
+                    detail=f"Advance receipt is {latest.get('status')!r}",
+                )
+            fresh_avail = round(float(latest.get("available_balance") or 0), 2)
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Insufficient advance balance — requested ₹{amount:.2f} "
+                    f"but only ₹{fresh_avail:.2f} available"
+                ),
+            )
+
+        # 5) Insert allocation ledger row. `payment_id` is filled in
+        # after step 6 succeeds. `idempotency_correlation_id` allows
+        # crash-recovery to rebuild the response.
+        allocation_no = await _next_advance_allocation_no(db, user["clinic_id"])
+        allocation = AdvanceAllocation(
+            allocation_no=allocation_no,
+            clinic_id=user["clinic_id"],
+            branch_id=user.get("branch_id") or receipt.get("branch_id"),
+            advance_receipt_id=receipt_id,
+            advance_receipt_no=receipt.get("receipt_no"),
+            invoice_id=payload.invoice_id,
+            invoice_no=invoice.get("invoice_no"),
+            patient_id=receipt.get("patient_id"),
+            amount=amount,
+            correlation_id=idem.correlation_id if idem.enabled else None,
+            idempotency_correlation_id=idem.correlation_id if idem.enabled else None,
+            note=payload.note,
+            created_by_user_id=user.get("user_id"),
+            created_by_name=user.get("name"),
+        )
+        allocation_id = allocation.allocation_id
+        try:
+            await db.advance_allocations.insert_one(allocation.model_dump())
+        except Exception:
+            # 5a) Rollback: restore advance balance.
+            await db.advance_receipts.find_one_and_update(
+                {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
+                {"$inc": {
+                    "available_balance": amount,
+                    "allocated_total": -amount,
+                }},
+            )
+            _log.exception(
+                "NAV-011 · allocation ledger insert failed (rolled back advance): "
+                "receipt_id=%s amount=%s", receipt_id, amount,
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Failed to persist allocation ledger row — advance restored.",
+            )
+
+        # 6) Payment via the proven NAV-009 atomic pipeline.
+        try:
+            updated_invoice, payment_doc = await record_payment_atomic(
+                db,
+                clinic_id=user["clinic_id"],
+                invoice_id=payload.invoice_id,
+                amount=amount,
+                method="advance",
+                received_by_user_id=user.get("user_id"),
+                reference=f"Allocation from {receipt.get('receipt_no', receipt_id)}",
+                idempotency_correlation_id=idem.correlation_id if idem.enabled else None,
+                extra_fields={
+                    "advance_receipt_id": receipt_id,
+                    "allocation_id": allocation_id,
+                },
+            )
+        except HTTPException as pay_exc:
+            # 6a) Payment write failed. Mark allocation as system-voided
+            # (NO physical delete, per approved architecture), and
+            # restore advance balance.
+            now_iso = datetime.now(timezone.utc).isoformat()
+            void_reason = (
+                f"Payment write failed during allocation: "
+                f"{pay_exc.status_code} {pay_exc.detail}"
+            )
+            await db.advance_allocations.update_one(
+                {
+                    "allocation_id": allocation_id,
+                    "clinic_id": user["clinic_id"],
+                    "status": "active",
+                },
+                {"$set": {
+                    "status": "voided",
+                    "voided_at": now_iso,
+                    "void_reason": void_reason,
+                    "voided_by_user_id": user.get("user_id"),
+                    "voided_by_name": user.get("name"),
+                }},
+            )
+            await db.advance_receipts.find_one_and_update(
+                {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
+                {"$inc": {
+                    "available_balance": amount,
+                    "allocated_total": -amount,
+                }},
+            )
+            _log.warning(
+                "NAV-011 · allocation payment failed; system-voided "
+                "allocation_id=%s reason=%s",
+                allocation_id, void_reason,
+            )
+            raise
+
+        # 7) Backfill payment_id on the allocation row.
+        payment_id = payment_doc.get("payment_id")
+        try:
+            await db.advance_allocations.update_one(
+                {"allocation_id": allocation_id, "clinic_id": user["clinic_id"]},
+                {"$set": {"payment_id": payment_id}},
+            )
+        except Exception:
+            # Non-fatal — the payment IS the source of truth for money;
+            # the allocation row is still retrievable via
+            # idempotency_correlation_id + advance_receipt_id. Log and
+            # continue (rare Mongo failure between two ops).
+            _log.exception(
+                "NAV-011 · post-payment allocation update failed "
+                "(payment already committed): allocation_id=%s payment_id=%s",
+                allocation_id, payment_id,
+            )
+
+        # 8) Audit event.
+        await _emit_audit(
+            db, clinic_id=user["clinic_id"],
+            receipt_id=receipt_id, receipt_no=receipt.get("receipt_no"),
+            kind="allocated", actor=user,
+            payload={
+                "allocation_id": allocation_id,
+                "allocation_no": allocation_no,
+                "invoice_id": payload.invoice_id,
+                "invoice_no": invoice.get("invoice_no"),
+                "amount": amount,
+                "remaining_balance": round(
+                    float(after_receipt.get("available_balance") or 0), 2,
+                ),
+            },
+        )
+
+        # 9) Build the response body + close idempotency.
+        response_body = {
+            "allocation_id": allocation_id,
+            "allocation_no": allocation_no,
+            "advance_receipt_id": receipt_id,
+            "advance_receipt_no": receipt.get("receipt_no"),
+            "invoice_id": payload.invoice_id,
+            "invoice_no": invoice.get("invoice_no"),
+            "patient_id": receipt.get("patient_id"),
+            "amount": amount,
+            "status": "active",
+            "payment_id": payment_id,
+            "correlation_id": idem.correlation_id if idem.enabled else None,
+            "created_at": allocation.created_at,
+            "created_by_user_id": user.get("user_id"),
+            "created_by_name": user.get("name"),
+            "advance_receipt": _advance_snapshot(after_receipt),
+            "invoice": _invoice_snapshot(_deserialize(updated_invoice)),
+        }
+        if idem.enabled:
+            await idem.complete(
+                http_status=200,
+                response_body=response_body,
+                operation_id=allocation_id,
+            )
+        return response_body
+
+    except HTTPException as exc:
+        if idem.enabled:
+            await idem.fail(
+                http_status=exc.status_code,
+                response_body={"detail": exc.detail},
+                detail=str(exc.detail),
+            )
+        raise
+

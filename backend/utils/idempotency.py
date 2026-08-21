@@ -447,6 +447,13 @@ class IdempotencyContext:
         if coll == "partner_payouts":
             if row:
                 return _strip_mongo(row), 200
+        if coll == "advance_allocations":
+            # NAV-011 · Phase 2B.2 · Crash-recovery rebuild for the
+            # allocation writer. Return the persisted allocation row —
+            # the client can re-derive fresh invoice / advance snapshots
+            # via the normal read endpoints if it needs them.
+            if row:
+                return _strip_mongo(row), 200
         return (_strip_mongo(row or {}), 200)
 
     # ─── Finalisers ───────────────────────────────────────────────────

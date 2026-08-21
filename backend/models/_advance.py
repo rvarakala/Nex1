@@ -177,7 +177,7 @@ class AdvanceAuditEvent(BaseModel):
     clinic_id: str
     receipt_id: str
     receipt_no: Optional[str] = None
-    kind: Literal["created", "voided"]
+    kind: Literal["created", "voided", "allocated"]
     at: str = Field(default_factory=_now_iso)
     actor_user_id: Optional[str] = None
     actor_name: Optional[str] = None
