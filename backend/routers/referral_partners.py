@@ -38,6 +38,8 @@ from database import get_db
 from utils.numbering import next_number
 from utils.serde import serialize_datetime, deserialize_datetime
 from utils.tiers import require_tier
+from utils.idempotency import IdempotencyContext
+from fastapi.responses import JSONResponse
 
 
 router = APIRouter(prefix="/api/referral-partners")
@@ -700,6 +702,7 @@ async def attach_referral_code(
 async def create_payout(
     partner_id: str,
     payload: PayoutCreate,
+    request: Request,
     user=Depends(require_roles("clinic_owner", "super_admin", "accounts")),
     db=Depends(get_db),
 ):
@@ -711,91 +714,126 @@ async def create_payout(
     * Deducts pending `partner_recovery_ledger` entries from the gross
       commission before storing.
     * Records `created_by_user_id`.
+
+    NAV-012 · Optional `Idempotency-Key` header dedups the create per
+    `(clinic_id, "payout", key)` for 24h.  The correlation id is
+    embedded on the created `partner_payouts` row so a crash-recovery
+    retry can detect whether this write landed.
     """
-    p = await db.referral_partners.find_one(
-        {"partner_id": partner_id, "clinic_id": user["clinic_id"]},
-        {"_id": 0},
+    idem = await IdempotencyContext.enter(
+        request, db,
+        scope="payout", clinic_id=user["clinic_id"],
+        actor=user,
+        payload={"partner_id": partner_id, **payload.model_dump()},
+        route="/api/referral-partners/{partner_id}/payouts",
+        operation_collection="partner_payouts",
     )
-    if not p:
-        raise HTTPException(status_code=404, detail="Partner not found")
+    if idem.replayed:
+        body, status, headers = idem.replay_response()
+        return JSONResponse(content=body, status_code=status, headers=headers)
 
-    # ── Validate period bounds — reject inverted / null windows ────
-    if not payload.period_start or not payload.period_end:
-        raise HTTPException(
-            status_code=422,
-            detail="period_start and period_end are required (YYYY-MM-DD).",
+    try:
+        p = await db.referral_partners.find_one(
+            {"partner_id": partner_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0},
         )
-    if payload.period_start > payload.period_end:
-        raise HTTPException(
-            status_code=422,
-            detail="period_start must be ≤ period_end",
+        if not p:
+            raise HTTPException(status_code=404, detail="Partner not found")
+
+        # ── Validate period bounds — reject inverted / null windows ────
+        if not payload.period_start or not payload.period_end:
+            raise HTTPException(
+                status_code=422,
+                detail="period_start and period_end are required (YYYY-MM-DD).",
+            )
+        if payload.period_start > payload.period_end:
+            raise HTTPException(
+                status_code=422,
+                detail="period_start must be ≤ period_end",
+            )
+
+        # ── Bundle 3 · Overlap guard ───────────────────────────────────
+        # Two ACTIVE (status ≠ void) payouts for the same (clinic, partner)
+        # cannot share overlapping [start, end] windows. Inclusive on both
+        # ends because YYYY-MM-DD strings compare correctly lexicographically.
+        conflict = await db.partner_payouts.find_one(
+            {
+                "clinic_id": user["clinic_id"],
+                "partner_id": partner_id,
+                "status": {"$nin": ["void"]},
+                "period_start": {"$lte": payload.period_end},
+                "period_end":   {"$gte": payload.period_start},
+            },
+            {"_id": 0, "payout_id": 1, "period_start": 1, "period_end": 1, "status": 1},
+        )
+        if conflict:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Overlapping active payout {conflict['payout_id']} exists for this "
+                    f"partner covering {conflict['period_start']} → {conflict['period_end']} "
+                    f"(status={conflict['status']}). Void it first or choose a distinct window."
+                ),
+            )
+
+        stats = await _attribute_revenue(
+            db, user["clinic_id"], partner_id,
+            payload.period_start, payload.period_end,
+        )
+        gross_commission = _compute_commission(p, stats["total_revenue"], stats["patients"])
+
+        # ── Bundle 5 · Recovery-ledger deduction ────────────────────────
+        net_commission, applied_ids, deducted = await _consume_pending_recovery(
+            db, clinic_id=user["clinic_id"], partner_id=partner_id,
+            gross_commission=gross_commission, actor=user,
         )
 
-    # ── Bundle 3 · Overlap guard ───────────────────────────────────
-    # Two ACTIVE (status ≠ void) payouts for the same (clinic, partner)
-    # cannot share overlapping [start, end] windows. Inclusive on both
-    # ends because YYYY-MM-DD strings compare correctly lexicographically.
-    conflict = await db.partner_payouts.find_one(
-        {
-            "clinic_id": user["clinic_id"],
-            "partner_id": partner_id,
-            "status": {"$nin": ["void"]},
-            "period_start": {"$lte": payload.period_end},
-            "period_end":   {"$gte": payload.period_start},
-        },
-        {"_id": 0, "payout_id": 1, "period_start": 1, "period_end": 1, "status": 1},
-    )
-    if conflict:
-        raise HTTPException(
-            status_code=409,
-            detail=(
-                f"Overlapping active payout {conflict['payout_id']} exists for this "
-                f"partner covering {conflict['period_start']} → {conflict['period_end']} "
-                f"(status={conflict['status']}). Void it first or choose a distinct window."
-            ),
+        payout_id = await next_number(db, "payout", user["clinic_id"])
+        payout = PartnerPayout(
+            payout_id=payout_id,
+            clinic_id=user["clinic_id"],
+            partner_id=partner_id,
+            period_start=payload.period_start,
+            period_end=payload.period_end,
+            referral_count=stats["patients"],
+            attributed_revenue=stats["total_revenue"],
+            commission_amount=net_commission,
+            gross_commission_amount=gross_commission,
+            recovery_applied_amount=deducted,
+            recovery_applied_ids=applied_ids,
+            notes=payload.notes,
+            created_by_user_id=user.get("user_id"),
+            created_by_name=user.get("name", ""),
         )
-
-    stats = await _attribute_revenue(
-        db, user["clinic_id"], partner_id,
-        payload.period_start, payload.period_end,
-    )
-    gross_commission = _compute_commission(p, stats["total_revenue"], stats["patients"])
-
-    # ── Bundle 5 · Recovery-ledger deduction ────────────────────────
-    net_commission, applied_ids, deducted = await _consume_pending_recovery(
-        db, clinic_id=user["clinic_id"], partner_id=partner_id,
-        gross_commission=gross_commission, actor=user,
-    )
-
-    payout_id = await next_number(db, "payout", user["clinic_id"])
-    payout = PartnerPayout(
-        payout_id=payout_id,
-        clinic_id=user["clinic_id"],
-        partner_id=partner_id,
-        period_start=payload.period_start,
-        period_end=payload.period_end,
-        referral_count=stats["patients"],
-        attributed_revenue=stats["total_revenue"],
-        commission_amount=net_commission,
-        gross_commission_amount=gross_commission,
-        recovery_applied_amount=deducted,
-        recovery_applied_ids=applied_ids,
-        notes=payload.notes,
-        created_by_user_id=user.get("user_id"),
-        created_by_name=user.get("name", ""),
-    )
-    await db.partner_payouts.insert_one(serialize_datetime(payout.model_dump()))
-    await _emit_referral_event(
-        db, clinic_id=user["clinic_id"], kind="payout_created",
-        actor=user, subject_id=payout_id,
-        new_value={
-            "period_start": payload.period_start, "period_end": payload.period_end,
-            "gross_commission": gross_commission,
-            "recovery_deducted": deducted, "net_commission": net_commission,
-        },
-        ref_doc={"partner_id": partner_id},
-    )
-    return payout
+        payout_doc = serialize_datetime(payout.model_dump())
+        if idem.enabled:
+            payout_doc["idempotency_correlation_id"] = idem.correlation_id
+        await db.partner_payouts.insert_one(payout_doc)
+        await _emit_referral_event(
+            db, clinic_id=user["clinic_id"], kind="payout_created",
+            actor=user, subject_id=payout_id,
+            new_value={
+                "period_start": payload.period_start, "period_end": payload.period_end,
+                "gross_commission": gross_commission,
+                "recovery_deducted": deducted, "net_commission": net_commission,
+            },
+            ref_doc={"partner_id": partner_id},
+        )
+        response_body = serialize_datetime(payout.model_dump())
+        if idem.enabled:
+            await idem.complete(
+                http_status=200, response_body=response_body,
+                operation_id=payout_id,
+            )
+        return payout
+    except HTTPException as exc:
+        if idem.enabled:
+            await idem.fail(
+                http_status=exc.status_code,
+                response_body={"detail": exc.detail},
+                detail=str(exc.detail),
+            )
+        raise
 
 
 @router.get(

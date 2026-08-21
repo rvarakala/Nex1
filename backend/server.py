@@ -286,6 +286,51 @@ async def lifespan(_app: FastAPI):
         await db.partner_payouts.create_index("payout_id", unique=True)
         await db.partner_payouts.create_index([("clinic_id", 1), ("partner_id", 1), ("created_at", -1)])
         await db.patients.create_index([("clinic_id", 1), ("referral_partner_id", 1)])
+        # NAV-012 · Bundle C — recovery-ledger indexes.
+        # `recovery_id` uniqueness backs the CAS update in
+        # `_consume_pending_recovery`; compound indexes back the two
+        # read paths (`{clinic, partner, status}` scan + admin list).
+        # Wrapped in try/except so partial preview data cannot break
+        # boot; same soft-fail pattern as the NAV-008 invoice unique
+        # index above.
+        try:
+            await db.partner_recovery_ledger.create_index(
+                "recovery_id", unique=True, name="uniq_recovery_id",
+            )
+        except Exception as _rec_err:
+            _log.error(
+                "NAV-012 · unique index on partner_recovery_ledger.recovery_id "
+                "NOT installed: %s. Duplicate recovery_ids may exist.", _rec_err,
+            )
+        await db.partner_recovery_ledger.create_index(
+            [("clinic_id", 1), ("partner_id", 1), ("status", 1), ("created_at", 1)],
+            name="rec_clinic_partner_status_ct",
+        )
+        await db.partner_recovery_ledger.create_index(
+            [("clinic_id", 1), ("status", 1), ("created_at", -1)],
+            name="rec_clinic_status_ct",
+        )
+        # NAV-012 · Bundle A — idempotency-key store.
+        # `(clinic_id, scope, idempotency_key)` UNIQUE arbitrates
+        # concurrent duplicate requests. `expires_at` TTL auto-purges
+        # records after 24h. `operation_ref.id_value` supports
+        # reverse-lookup during crash-recovery.
+        await db.idempotency_keys.create_index(
+            [("clinic_id", 1), ("scope", 1), ("idempotency_key", 1)],
+            unique=True, name="uniq_clinic_scope_key",
+        )
+        await db.idempotency_keys.create_index(
+            [("operation_ref.id_value", 1)], name="idem_op_ref_id",
+        )
+        # TTL: expireAfterSeconds=0 uses `expires_at` value verbatim.
+        try:
+            await db.idempotency_keys.drop_index("idem_expires_ttl")
+        except Exception:
+            pass
+        await db.idempotency_keys.create_index(
+            [("expires_at", 1)],
+            name="idem_expires_ttl", expireAfterSeconds=0,
+        )
         # Patient Portal (M13, Phase 13.D)
         await db.patient_otps.create_index([("clinic_id", 1), ("patient_id", 1)], unique=True)
         await db.patient_appointment_requests.create_index("request_id", unique=True)

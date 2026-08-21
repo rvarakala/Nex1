@@ -7,7 +7,8 @@ GST invoice engine with:
 - Running counter per clinic-year (INV/2026/000001 style)
 - Report delivery logging (print / whatsapp / email / in_person)
 """
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Request
+from fastapi.responses import JSONResponse
 from typing import List, Literal, Optional
 from datetime import datetime, timezone
 import logging
@@ -30,6 +31,7 @@ from models import (
     INVOICE_STATUSES,
 )
 from auth import get_current_user, require_roles
+from utils.idempotency import IdempotencyContext
 
 billing_router = APIRouter(prefix="/api")
 
@@ -267,16 +269,22 @@ async def record_payment_atomic(
     reference: Optional[str] = None,
     notes: Optional[str] = None,
     enforce_overpay: bool = True,
+    idempotency_correlation_id: Optional[str] = None,
 ) -> tuple[dict, dict]:
     """Atomic payment writer used by canonical billing + all HA payment
     capture flows. Returns (updated_invoice_dict, payment_dict).
 
     Raises HTTPException on: non-finite / non-positive amount, missing
-    invoice, cancelled invoice, or overpayment (payload > current
-    due_total + MONEY_TOL).
+    invoice, cancelled / refunded / partially_refunded invoice
+    (NAV-012 F-15), or overpayment (payload > current due_total +
+    MONEY_TOL).
 
     Preserves the invariant `db.payments.payment_id == embedded
     invoice.payments[].payment_id` on success.
+
+    ``idempotency_correlation_id`` — NAV-012.  When supplied by the
+    idempotent wrapper, is stamped onto the created payment row so
+    crash-recovery can detect whether this write landed.
     """
     amt = float(amount)
     if not math.isfinite(amt):
@@ -302,6 +310,8 @@ async def record_payment_atomic(
         "received_by_user_id": received_by_user_id,
         "notes": notes,
     }
+    if idempotency_correlation_id:
+        pay_doc["idempotency_correlation_id"] = idempotency_correlation_id
 
     # 1) Insert top-level row first. UUID collision is astronomically
     # unlikely; on the off-chance retry once with a fresh id.
@@ -313,21 +323,31 @@ async def record_payment_atomic(
         await db.payments.insert_one(dict(pay_doc))
 
     # 2) Atomic conditional invoice update.
+    #
+    # NAV-012 · Bundle B (F-15) — Payments are DB-level rejected on
+    # cancelled invoices AND on any invoice that already carries a
+    # refund (`status ∈ {refunded, partially_refunded}` OR
+    # `refunded_total > 0`).  Enforcing inside the aggregation-pipeline
+    # match keeps the guard atomic with the CAS overpay check.
     match: dict = {
         "invoice_id": invoice_id,
         "clinic_id": clinic_id,
-        # Payments are rejected only on cancelled invoices — matches the
-        # pre-NAV-009 behaviour. `refunded` / `partially_refunded`
-        # semantics are the P2 finding NAV009-PAY-006 and were NOT
-        # approved for Phase 2A; keeping them accepted here so this
-        # sprint does not silently change user-facing behaviour.
-        "status": {"$ne": "cancelled"},
+        "status": {"$nin": ["cancelled", "refunded", "partially_refunded"]},
     }
+    # `refunded_total` may be missing on legacy rows — treat null as 0.
+    refunded_guard = {"$expr": {"$lte": [{"$ifNull": ["$refunded_total", 0]}, 0]}}
     if enforce_overpay:
-        match["$expr"] = {"$gte": [
-            {"$subtract": [_due_expr_field(), {"$ifNull": ["$paid_total", 0]}]},
-            amt - MONEY_TOL,
+        match["$expr"] = {"$and": [
+            {"$gte": [
+                {"$subtract": [_due_expr_field(), {"$ifNull": ["$paid_total", 0]}]},
+                amt - MONEY_TOL,
+            ]},
+            {"$lte": [{"$ifNull": ["$refunded_total", 0]}, 0]},
         ]}
+    else:
+        # Even without overpay enforcement, still block payments against
+        # any invoice that has already been refunded (NAV-012 F-15).
+        match["$expr"] = refunded_guard["$expr"]
 
     pipeline = [
         {"$set": {
@@ -362,13 +382,32 @@ async def record_payment_atomic(
         inv = await db.invoices.find_one(
             {"invoice_id": invoice_id, "clinic_id": clinic_id},
             {"_id": 0, "status": 1, "paid_total": 1,
-             "rounded_total": 1, "grand_total": 1},
+             "rounded_total": 1, "grand_total": 1, "refunded_total": 1},
         )
         if not inv:
             raise HTTPException(status_code=404, detail="Invoice not found")
         st = (inv.get("status") or "").lower()
         if st == "cancelled":
             raise HTTPException(status_code=400, detail="Cannot add payment to a cancelled invoice")
+        # NAV-012 F-15 — refunded / partially_refunded / any refunded_total > 0
+        # invoice cannot accept a fresh payment.
+        if st in ("refunded", "partially_refunded"):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot add a payment to a refunded invoice "
+                    f"(status={st}). Create a fresh invoice instead."
+                ),
+            )
+        if round(float(inv.get("refunded_total") or 0), 2) > MONEY_TOL:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Cannot add a payment to an invoice that has been refunded "
+                    f"(refunded_total=₹{float(inv['refunded_total']):.2f}). "
+                    "Create a fresh invoice instead."
+                ),
+            )
         # Overpayment path.
         due = round(
             float(inv.get("rounded_total") or inv.get("grand_total") or 0)
@@ -396,6 +435,7 @@ async def record_refund_atomic(
     received_by_user_id: Optional[str] = None,
     reference: Optional[str] = None,
     notes: Optional[str] = None,
+    idempotency_correlation_id: Optional[str] = None,
 ) -> tuple[dict, dict]:
     """Atomic refund writer. `amount` is the POSITIVE refund value;
     stored on the row as a NEGATIVE amount so `_sum_invoice`'s
@@ -432,6 +472,8 @@ async def record_refund_atomic(
         "received_by_user_id": received_by_user_id,
         "notes": notes,
     }
+    if idempotency_correlation_id:
+        refund_doc["idempotency_correlation_id"] = idempotency_correlation_id
     try:
         await db.payments.insert_one(dict(refund_doc))
     except DuplicateKeyError:
@@ -1068,11 +1110,16 @@ async def get_invoice(invoice_id: str,
     return _deserialize(inv)
 
 
-@billing_router.post("/billing/invoices/{invoice_id}/payments", response_model=Invoice)
+@billing_router.post("/billing/invoices/{invoice_id}/payments", response_model=None)
 async def add_payment(invoice_id: str, payload: PaymentCreate,
+                      request: Request,
                       user=Depends(require_roles(*_PAYMENT_ROLES)),
                       db=Depends(get_db)):
     """NAV-009 · Capture a patient payment against an invoice.
+
+    NAV-012 · Optional `Idempotency-Key` header — when present the
+    request is deduplicated per `(clinic_id, "payment", key)` for 24h.
+    Absent → transparent no-op preserving prior NAV-009 behaviour.
 
     Concurrency & correctness: delegates to `record_payment_atomic`
     which enforces overpayment guard, tenant match and cancelled /
@@ -1082,65 +1129,93 @@ async def add_payment(invoice_id: str, payload: PaymentCreate,
     `db.payments` (for `/billing/payments` + `/billing/collections`
     KPIs) and `invoices.payments[]` (for InvoiceDetail rendering).
     """
-    # Snapshot pre-write status for the auto-flip side-effect gate
-    # below (mark_sale_paid_internal + accessory stock decrement).
-    prev = await db.invoices.find_one(
-        {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
-        {"_id": 0, "status": 1, "linked_sale_no": 1, "invoice_no": 1},
+    idem = await IdempotencyContext.enter(
+        request, db,
+        scope="payment", clinic_id=user["clinic_id"],
+        actor=user, payload={"invoice_id": invoice_id, **payload.model_dump()},
+        route="/api/billing/invoices/{invoice_id}/payments",
+        operation_collection="payments",
     )
-    was_paid_before = bool(prev and prev.get("status") == "paid")
-    linked_sale_no = prev.get("linked_sale_no") if prev else None
+    if idem.replayed:
+        body, status, headers = idem.replay_response()
+        return JSONResponse(content=body, status_code=status, headers=headers)
 
-    updated_doc, _pay = await record_payment_atomic(
-        db,
-        clinic_id=user["clinic_id"],
-        invoice_id=invoice_id,
-        amount=float(payload.amount),
-        method=payload.method,
-        received_by_user_id=user["user_id"],
-        reference=payload.reference,
-        notes=payload.notes,
-        enforce_overpay=True,
-    )
-    inv = Invoice(**_deserialize(updated_doc))
+    try:
+        # Snapshot pre-write status for the auto-flip side-effect gate
+        # below (mark_sale_paid_internal + accessory stock decrement).
+        prev = await db.invoices.find_one(
+            {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0, "status": 1, "linked_sale_no": 1, "invoice_no": 1},
+        )
+        was_paid_before = bool(prev and prev.get("status") == "paid")
+        linked_sale_no = prev.get("linked_sale_no") if prev else None
 
-    # Auto-flip linked HA sale → paid (P2 Quote→Sale→Invoice→Paid one-click)
-    # Trigger only on the transition to fully-paid; idempotent if already paid.
-    if inv.status == "paid" and not was_paid_before and linked_sale_no:
-        try:
-            from routers.ha_sales import mark_sale_paid_internal
-            await mark_sale_paid_internal(
-                db, user["clinic_id"], linked_sale_no,
-                actor_user_id=user["user_id"], invoice_no=inv.invoice_no,
-            )
-        except HTTPException as exc:
-            logging.getLogger(__name__).warning(
-                f"Auto-flip on payment skipped for sale {linked_sale_no}: {exc.detail}",
-            )
+        updated_doc, _pay = await record_payment_atomic(
+            db,
+            clinic_id=user["clinic_id"],
+            invoice_id=invoice_id,
+            amount=float(payload.amount),
+            method=payload.method,
+            received_by_user_id=user["user_id"],
+            reference=payload.reference,
+            notes=payload.notes,
+            enforce_overpay=True,
+            idempotency_correlation_id=idem.correlation_id if idem.enabled else None,
+        )
+        inv = Invoice(**_deserialize(updated_doc))
 
-    # ---- Auto-decrement accessory stock on paid transition -----------
-    # Fires exactly once per line, guarded by
-    # `InvoiceLine.accessory_stock_decremented`. Never raises — a stock
-    # mismatch must not block the clinic from taking money.
-    if inv.status == "paid" and not was_paid_before:
-        try:
-            from utils.accessory_stock import auto_decrement_accessory_stock
-            fresh_inv_doc = await db.invoices.find_one({"invoice_id": invoice_id}, {"_id": 0})
-            if fresh_inv_doc:
-                await auto_decrement_accessory_stock(
-                    db, fresh_inv_doc,
-                    actor_user_id=user["user_id"],
-                    branch_id=user.get("branch_id"),
+        # Auto-flip linked HA sale → paid (P2 Quote→Sale→Invoice→Paid one-click)
+        # Trigger only on the transition to fully-paid; idempotent if already paid.
+        if inv.status == "paid" and not was_paid_before and linked_sale_no:
+            try:
+                from routers.ha_sales import mark_sale_paid_internal
+                await mark_sale_paid_internal(
+                    db, user["clinic_id"], linked_sale_no,
+                    actor_user_id=user["user_id"], invoice_no=inv.invoice_no,
                 )
-        except Exception as exc:  # noqa: BLE001 — defensive
-            logging.getLogger(__name__).warning(
-                f"Accessory auto-decrement failed for invoice {inv.invoice_no}: {exc}",
+            except HTTPException as exc:
+                logging.getLogger(__name__).warning(
+                    f"Auto-flip on payment skipped for sale {linked_sale_no}: {exc.detail}",
+                )
+
+        # ---- Auto-decrement accessory stock on paid transition -----------
+        # Fires exactly once per line, guarded by
+        # `InvoiceLine.accessory_stock_decremented`. Never raises — a stock
+        # mismatch must not block the clinic from taking money.
+        if inv.status == "paid" and not was_paid_before:
+            try:
+                from utils.accessory_stock import auto_decrement_accessory_stock
+                fresh_inv_doc = await db.invoices.find_one({"invoice_id": invoice_id}, {"_id": 0})
+                if fresh_inv_doc:
+                    await auto_decrement_accessory_stock(
+                        db, fresh_inv_doc,
+                        actor_user_id=user["user_id"],
+                        branch_id=user.get("branch_id"),
+                    )
+            except Exception as exc:  # noqa: BLE001 — defensive
+                logging.getLogger(__name__).warning(
+                    f"Accessory auto-decrement failed for invoice {inv.invoice_no}: {exc}",
+                )
+        body = _deserialize(updated_doc)
+        if idem.enabled:
+            await idem.complete(
+                http_status=200, response_body=body,
+                operation_id=_pay.get("payment_id"),
             )
-    return inv
+        return inv
+    except HTTPException as exc:
+        if idem.enabled:
+            await idem.fail(
+                http_status=exc.status_code,
+                response_body={"detail": exc.detail},
+                detail=str(exc.detail),
+            )
+        raise
 
 
-@billing_router.post("/billing/invoices/{invoice_id}/refund", response_model=Invoice)
+@billing_router.post("/billing/invoices/{invoice_id}/refund", response_model=None)
 async def refund_invoice(invoice_id: str, payload: RefundCreate,
+                         request: Request,
                          user=Depends(get_current_user), db=Depends(get_db)):
     """Record a refund against a paid/partial invoice — record-only, no
     payment-gateway integration. Persists a Payment row with
@@ -1152,33 +1227,63 @@ async def refund_invoice(invoice_id: str, payload: RefundCreate,
     * Repeated partials are additive (multiple refund rows accumulate).
 
     Roles allowed: clinic_owner, accounts, front_desk, super_admin, founder.
+
+    NAV-012 · Optional `Idempotency-Key` header dedups the refund per
+    `(clinic_id, "refund", key)` for 24h.
     """
     if user.get("role") not in {"clinic_owner", "accounts", "front_desk", "super_admin", "founder"}:
         raise HTTPException(status_code=403, detail="You don't have permission to issue refunds")
 
-    # NAV-009 · REF-001 — delegate to atomic writer. Pre-flight
-    # existence check kept to preserve historical 404 payload shape
-    # (record_refund_atomic returns 404 too, but this way any future
-    # divergence stays localised).
-    exists = await db.invoices.find_one(
-        {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
-        {"_id": 0, "invoice_id": 1},
+    idem = await IdempotencyContext.enter(
+        request, db,
+        scope="refund", clinic_id=user["clinic_id"],
+        actor=user, payload={"invoice_id": invoice_id, **payload.model_dump()},
+        route="/api/billing/invoices/{invoice_id}/refund",
+        operation_collection="payments",
     )
-    if not exists:
-        raise HTTPException(status_code=404, detail="Invoice not found")
+    if idem.replayed:
+        body, status, headers = idem.replay_response()
+        return JSONResponse(content=body, status_code=status, headers=headers)
 
-    updated_doc, _refund = await record_refund_atomic(
-        db,
-        clinic_id=user["clinic_id"],
-        invoice_id=invoice_id,
-        amount=float(payload.amount),
-        method=payload.method,
-        reason=payload.reason,
-        reference=payload.reference,
-        notes=payload.notes,
-        received_by_user_id=user["user_id"],
-    )
-    return Invoice(**_deserialize(updated_doc))
+    try:
+        # NAV-009 · REF-001 — delegate to atomic writer. Pre-flight
+        # existence check kept to preserve historical 404 payload shape
+        # (record_refund_atomic returns 404 too, but this way any future
+        # divergence stays localised).
+        exists = await db.invoices.find_one(
+            {"invoice_id": invoice_id, "clinic_id": user["clinic_id"]},
+            {"_id": 0, "invoice_id": 1},
+        )
+        if not exists:
+            raise HTTPException(status_code=404, detail="Invoice not found")
+
+        updated_doc, _refund = await record_refund_atomic(
+            db,
+            clinic_id=user["clinic_id"],
+            invoice_id=invoice_id,
+            amount=float(payload.amount),
+            method=payload.method,
+            reason=payload.reason,
+            reference=payload.reference,
+            notes=payload.notes,
+            received_by_user_id=user["user_id"],
+            idempotency_correlation_id=idem.correlation_id if idem.enabled else None,
+        )
+        body = _deserialize(updated_doc)
+        if idem.enabled:
+            await idem.complete(
+                http_status=200, response_body=body,
+                operation_id=_refund.get("payment_id"),
+            )
+        return Invoice(**body)
+    except HTTPException as exc:
+        if idem.enabled:
+            await idem.fail(
+                http_status=exc.status_code,
+                response_body={"detail": exc.detail},
+                detail=str(exc.detail),
+            )
+        raise
 
 
 # --------------- CONSOLIDATED PAYMENTS + REFUNDS LISTING ---------------
