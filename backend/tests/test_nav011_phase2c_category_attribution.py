@@ -532,6 +532,73 @@ def test_p2c_discretionary_partner_zero_fixed_still_gets_attribution(tok):
 # Backward compatibility guard — Phase 2A response shape preserved
 # =====================================================================
 
+def test_p2c_canonical_business_example_10k_diag_100k_ha_discretionary_payout(tok):
+    """User's canonical business example, verbatim:
+
+        Dr X refers 10 patients.
+        Diagnostics generated: ₹10,000.
+        Two patients subsequently purchase Hearing Aids: ₹1,00,000.
+        Revenue attribution must show:
+          Diagnostics Revenue = ₹10,000
+          Hearing Aid / Core Business Revenue = ₹1,00,000
+          Total Revenue Generated = ₹1,10,000
+        Separately the user may set Referral Amount = ₹12,000 OR ₹0
+        OR any other user-designated amount. The ₹12,000 is NOT
+        automatically derived from the ₹1,10,000.
+
+    Enforces the semantic distinction end-to-end:
+      * Revenue attribution reflects what patients GENERATED.
+      * The payout writer's ``commission_estimate`` is a SEPARATE
+        quantity governed by ``commission_kind`` / ``commission_value``.
+      * The two must remain independent — Phase 2C must NEVER label
+        or derive the ₹1,10,000 as the referral amount, and must
+        NEVER add a payout-shaped field to the response.
+    """
+    p = _mk_partner(tok, kind="percent", value=10.0)
+    diag_svc = _mk_service(tok, price=1000.0, category="Consultation")
+    ha_svc = _mk_service(tok, price=50000.0, category="Consultation")
+
+    ha_patients = []
+    for i in range(10):
+        pat = _mk_patient(tok)
+        _attach_partner(tok, pat, p["referral_code"])
+        _mk_invoice(tok, pat, diag_svc, unit_price=1000.0,
+                    initial_payment=1000.0)
+        if i < 2:
+            ha_patients.append(pat)
+    for pat in ha_patients:
+        ha_inv = _mk_invoice(tok, pat, ha_svc,
+                             unit_price=50000.0, initial_payment=50000.0)
+        _link_invoice_to_ha_wing_appointment(ha_inv["invoice_id"], pat)
+
+    s = _get_stats(tok, p["partner_id"])["stats"]
+
+    # ── REVENUE ATTRIBUTION (what patients generated) ──
+    assert s["diagnostics_revenue"] == 10000.0
+    assert s["ha_sales_revenue"] == 100000.0
+    assert s["total_attributed_revenue"] == 110000.0
+    # ── Payout writer's commission is a SEPARATE quantity ──
+    # Phase 2A payout uses `total_revenue` (which for these purely
+    # invoice-only referrals equals ₹1,10,000), so 10% = ₹11,000.
+    # This value is intentionally different from every attribution
+    # figure above.
+    assert s["commission_estimate"] == 11000.0
+    # ── Semantic distinction guards ──
+    assert s["diagnostics_revenue"] != s["commission_estimate"]
+    assert s["ha_sales_revenue"] != s["commission_estimate"]
+    assert s["total_attributed_revenue"] != s["commission_estimate"]
+    # No payout-shaped field must have been introduced by Phase 2C.
+    forbidden_field_names = {
+        "referral_amount", "amount_payable", "commission_due",
+        "doctor_payment", "amount_due_to_partner",
+    }
+    assert set(s.keys()).isdisjoint(forbidden_field_names), (
+        f"Phase 2C must not introduce a payout-shaped field. "
+        f"Found: {set(s.keys()) & forbidden_field_names}"
+    )
+
+
+
 def test_p2c_response_shape_preserves_all_legacy_fields(tok):
     """A single sanity assertion enumerating every field the Phase 2A
     contract advertised. Frontend clients that never learned the new
