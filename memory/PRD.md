@@ -1,6 +1,132 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-012 — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview implementation, exhaustive Preview regression (287/287 on isolated runs), user's manual Production deployment, and read-only Production post-deployment verification.
+
+**Title**: NAV-012 — Financial Idempotency + F-15 Payment Guard + Recovery-Ledger Indexes · Phase 2A
+**Production status**: DEPLOYED AND POST-DEPLOYMENT VERIFIED
+**Final verification verdict**: **🟡 PASS WITH OBSERVATION** — preserved verbatim. NOT upgraded to unconditional 🟢 PASS. The verdict deliberately captures that the authenticated financial data-plane behaviour of NAV-012 is Preview/regression-verified only; the Production verification pass was strictly unauthenticated / read-only per the No-Smoke-Transaction rule set at authorization time.
+
+**Approved Phase 2A scope · completed**:
+
+- **Bundle A — Idempotency-Key** (optional header) on three financial write endpoints:
+  - `POST /api/billing/invoices/{invoice_id}/payments`
+  - `POST /api/billing/invoices/{invoice_id}/refund`
+  - `POST /api/referral-partners/{partner_id}/payouts`
+  - **Header contract**: `Idempotency-Key: [A-Za-z0-9_\-]{8,128}`. Missing → transparent no-op preserving pre-NAV-012 behaviour byte-for-byte. Malformed → HTTP 400 before any business op runs.
+  - **Storage**: new collection `db.idempotency_keys` with document shape `{clinic_id, idempotency_key, scope, route, request_hash, status, http_status, response_body, operation_ref{collection,field,value}, created_at, completed_at, expires_at, actor, failure}`.
+  - **Uniqueness (tenant + scope-scoped)**: compound partial-UNIQUE index `(clinic_id, scope, idempotency_key)` — two tenants can share the same key value; two scopes within one tenant can share the same key value. Both scenarios explicitly regression-tested.
+  - **Scopes**: `payment`, `refund`, `payout`.
+  - **State machine**: `in_flight` → `completed` | `failed`.
+  - **Payload-mismatch protection**: unconditional SHA-256 canonical-JSON hash comparison → HTTP 422 with clear detail on reuse-with-different-payload.
+  - **Replay behaviour**: both HTTP status AND body cached and replayed byte-for-byte via `JSONResponse`. Replayed responses carry `Idempotency-Replay: true` header. All bodies pass through `jsonable_encoder` + custom `_strip_mongo` walker so ObjectId / datetime never leak.
+  - **Concurrency arbitration**: the UNIQUE index arbitrates concurrent duplicates. First arriver wins the `insert_one`; every duplicate produces a `DuplicateKeyError` → server reads existing record → replays completed/failed OR returns HTTP 409 on fresh in-flight.
+  - **24-hour TTL**: `expires_at` field + TTL index `expireAfterSeconds=0` auto-purges stale records at Mongo's TTL sweep cadence.
+  - **Crash recovery** (built ahead of naive-TTL fallback per user's explicit safety mandate):
+    - Every business op is embedded with a pre-generated `idempotency_correlation_id` written into `payments.idempotency_correlation_id` / `partner_payouts.idempotency_correlation_id`.
+    - On stale `in_flight` record (age > 90 s):
+      - If correlated business row **exists** → rebuild JSON-safe response from the persisted row, flip idempotency record to `completed`, return replay. **No second financial write.**
+      - If correlated business row **missing** → atomic CAS-takeover of the slot with fresh `created_at` + new `correlation_id`. CAS winner runs the business op once.
+      - If lookup **ambiguous** (errored) → HTTP 409 + logged WARNING. Refuse to write money.
+
+- **Bundle B — F-15 payment guard** enforced inside `record_payment_atomic` at the DB-level aggregation-pipeline `find_one_and_update` match:
+  - Rejects payments against invoices where `status ∈ {cancelled, refunded, partially_refunded}` OR `refunded_total > 0`.
+  - HTTP 400 with a clear diagnostic (`"Cannot add a payment to a refunded invoice (status=<X>). Create a fresh invoice instead."` / `"...refunded_total=₹<X>..."`).
+  - Cancelled-invoice rejection preserved unchanged.
+  - Legacy `paid_total=None, refunded_total absent` fallback path preserved unchanged (`$lte: 0` on `$ifNull` handles null-as-zero).
+  - Zero regressions across the 20 pre-existing NAV-009 tests.
+
+- **Bundle C — `partner_recovery_ledger` indexes** installed at `lifespan()` in `backend/server.py`:
+  - **UNIQUE** `recovery_id` (`uniq_recovery_id`) — backs the CAS `update_one({recovery_id, status='pending'})` inside `_consume_pending_recovery`. Wrapped in try/except (NAV-008 soft-fail pattern) so partial Preview data cannot break boot; installed cleanly on Preview.
+  - **Non-unique** `(clinic_id, partner_id, status, created_at)` (`rec_clinic_partner_status_ct`) — covers the pending-recovery scan inside `_consume_pending_recovery`.
+  - **Non-unique** `(clinic_id, status, created_at DESC)` (`rec_clinic_status_ct`) — covers `list_recovery` admin listing.
+  - **`(source_payout_id)` index explicitly NOT installed** — deferred to Phase 2B as approved.
+
+- **Bundle D — NOT IMPLEMENTED**: `GET /api/health/build`, `BUILD_COMMIT_SHA`, docstring cleanup, cosmetic changes, and unrelated observability all remain deferred per the explicit exclusion in the authorization.
+
+**Regression evidence (accurate, not rewritten, not hidden, not reclassified)**:
+- **NAV-012 targeted suite: 31/31 PASS** across two new test files:
+  - `backend/tests/test_nav012_idempotency.py` — 20 tests (payment/refund/payout first-hit + replay + payload-mismatch 422 + concurrent same-key + concurrent different keys + failed-op replay + missing key + malformed key + tenant isolation + scope isolation + TTL index present + crash-recovery LANDED + crash-recovery MISSING + in-flight-fresh 409 + TTL-expired permits new op).
+  - `backend/tests/test_nav012_payment_hardening.py` — 11 tests (F-15 fully-refunded / partially-refunded / refunded_total>0 rejection + cancelled preserved + normal payment / partial payment preserved + legacy path preserved + concurrent refund→payment rejected + concurrent payment→refund preserved + recovery-ledger indexes present + `(source_payout_id)` absent + `recovery_id` unique enforced).
+- **NAV-005 → NAV-012 combined regression on isolated runs: 287/287 PASS** across 17 test files.
+- **Two transient rate-limit-induced flakes** recorded verbatim (both pass deterministically on isolated re-run; caused by the pre-existing 60/minute `/auth/login` rate limiter tripping on batch execution):
+  - `test_nav005_sprint3a_merge_and_isolation.py::test_cross_tenant_history_read_forbidden` — passes 1.35 s on isolated re-run.
+  - `test_nav009_payments_refunds.py::test_pay003_partial_then_final_payment_flow` — passes 1.14 s on isolated re-run.
+- **Zero NAV-012-caused regressions** across the pre-existing 256 NAV-005..NAV-011 tests.
+- File-by-file reconciliation matches `pytest --collect-only`: NAV-005 (47) + NAV-006 (11+9+16+5+10+8+5=64) + NAV-007 (22) + NAV-008 (29) + NAV-009 (20) + NAV-010 (32) + NAV-011 (42) + **NAV-012 (20+11=31)** = **287**. Perfect arithmetic reconciliation, no test renamed / deleted / edited.
+- **Pre-existing failures preserved verbatim**: the two `test_referrals_dashboard_bugfix.py` demo-seed baseline failures (`test_sound_clinic_dashboard_returns_200_with_full_rows`, `test_dltest_regression_dashboard_still_works`) remain PRE-EXISTING and unaffected by NAV-012; the 5 pre-existing NAV-006 queue auto-discovery flakes remain PRE-EXISTING; the 18 demo-seed errors in `test_iter11_cross_tenant.py` remain PRE-EXISTING. None hidden, none reclassified, none touched.
+
+**Production deployment**:
+- Production deployment was performed **MANUALLY by the user**.
+- **Emergent did NOT deploy.**
+- No Production deployment was performed by the agent at any point.
+- Deployment scope: three modified backend files (`backend/billing.py`, `backend/routers/referral_partners.py`, `backend/server.py`) + three new backend files (`backend/utils/idempotency.py`, `backend/tests/test_nav012_idempotency.py`, `backend/tests/test_nav012_payment_hardening.py`).
+
+**Production post-deployment verification** (unauthenticated / read-only only):
+- `GET /api/health` → **200** (`{"status":"healthy","timestamp":"2026-08-21T07:25:31.195772+00:00"}`), 0.456 s.
+- `GET /` → **200**, SPA hydrated with `<title>AUDINEXA — Audiology Clinic OS</title>`, 0.597 s.
+- All three NAV-012 target routes present and 401-gated: `POST /api/billing/invoices/{dummy}/payments`, `POST /api/billing/invoices/{dummy}/refund`, `POST /api/referral-partners/{dummy}/payouts` — each probed both **with** and **without** an `Idempotency-Key` header → all six responses **401**.
+- **`Idempotency-Key` header confirmed to NOT bypass authentication** — no auth-shortcut path was introduced.
+- NAV-005 → NAV-011 protected surface intact: 27 total unauthenticated probes across `/api/auth/*`, `/api/diagnostics/*`, `/api/sessions`, `/api/hearing-reports/save`, `/api/billing/invoices*`, `/api/referral-partners*`, `/api/ha/*` — all returned 401 as expected.
+- **Zero unexpected 4xx · Zero 5xx · Zero 502/503/504.**
+- **Zero authenticated Production requests · Zero Production writes.**
+- Deliberate `GET /api/definitely-nonexistent-route` → 404, confirming the 401 responses reflect real authentication-gate hits (not path-not-found behaviour).
+
+**Preview vs Production verification boundary (do NOT upgrade)**:
+
+- **Directly Production-verified**:
+  - Application health, SPA availability.
+  - Route availability of all three NAV-012 endpoints.
+  - Authentication boundary — including the invariant that `Idempotency-Key` does not bypass auth.
+  - Full NAV-005 → NAV-011 protected surface still 401-gated.
+  - Absence of unexpected public / API errors.
+
+- **Preview / regression verified only — NOT Production-tested**:
+  - Idempotency-Key first-hit / replay behaviour.
+  - Payload-mismatch **HTTP 422** on same-key + different payload.
+  - Concurrent same-key arbitration (UNIQUE-index-driven).
+  - F-15 authenticated payment rejection on `refunded` / `partially_refunded` / `refunded_total > 0` invoices.
+  - Crash-recovery paths (business-op-landed replay, business-op-missing CAS-takeover, in-flight-fresh 409, ambiguous 409).
+  - Recovery-ledger index utilisation inside `_consume_pending_recovery`.
+  - `idempotency_keys` 24-hour TTL sweep.
+  - Production database contents (never queried).
+  - Production commit SHA (no public build-info endpoint exists — `/api/health/build`, `/api/version`, `/api/commit`, `/api/health/version` all returned 404 by design).
+  - Production application startup / index logs.
+
+  **These behaviours were not represented as Production-tested and are not being retrospectively certified as such by this closure.**
+
+- **Project convention preserved**: *"Preview represents Production unless contrary evidence is discovered."* Through the legitimately available read-only Production verification, **no contrary evidence was discovered**. The 🟡 verdict deliberately captures this convention without inflating it.
+
+**Historical financial data safety (this closure + the entire NAV-012 verification cycle)**:
+- **`tenant-sound-clinic-blr / INV/2026/000004`** remains untouched. Not queried, opened, referenced, renumbered, deleted, voided, merged, backfilled, or reconciled during NAV-012 build, regression, deployment, verification, or closure.
+- **10 duplicate `(clinic_id, partner_id, period)` payout groups on Preview** remain untouched (4 with 2+ non-void). Not queried, modified, voided, deleted, merged, or backfilled.
+- **55 dangling top-level `payments` rows on Preview** (rows whose `invoice_id` no longer exists in `db.invoices`) remain untouched. Not queried against Production; not modified anywhere.
+- **All historical `partner_recovery_ledger` rows** (58 on Preview: 42 pending / 16 applied / 0 void) remain untouched. Only new indexes added — no row-level `update`, `delete`, `deleteMany`, or `updateMany` executed against the collection.
+- **All historical invoices, payments, refunds, payouts** untouched.
+- **No historical financial-data cleanup occurred during NAV-012.**
+- **`scripts/nav008_counter_reconcile.py` remains dual-flag-gated and unchanged. Not executed.**
+- **No compound unique index installed on `invoices`** — soft-failing NAV-008 boot pattern preserved unchanged.
+- **No compound unique index installed on `partner_payouts`** — remains DEFERRED to Phase 2D.
+
+**Deferred backlog — do NOT implement**:
+- **NAV-011 Phase 2B** — automatic recovery-ledger emission from NAV-009 refund + NAV-010 quick-sale / invoice cancel; UX/RBAC hardening; audiologist role scope decision; docstring drift fix on `paid_total − refunded_total`; admin viewer for `referral_audit_events`; `partner_recovery_ledger.(source_payout_id)` index.
+- **NAV-011 Phase 2D** — historical duplicate payout reconciliation on the 10 groups (4 non-void); controlled correction/void/reversal workflow; and, only afterwards, install the compound partial-unique index on `partner_payouts`.
+- **NAV-008 counter reconciliation** — remains dual-flag-gated; script `scripts/nav008_counter_reconcile.py` refuses to run without `NAV008_MIGRATE=1 AND NAV008_MIGRATE_OVERRIDE=1`. Not executed.
+- **Historical invoice duplicate cleanup** — `tenant-sound-clinic-blr / INV/2026/000004` remediation choices (renumber / cancel-and-reissue / retire-with-flag) require finance/GST sign-off. Deferred.
+- **Invoice compound unique index** (`{clinic_id, invoice_no}` partial on `invoice_no is string`) — blocked by the historical duplicate; will install cleanly after remediation.
+- **`partner_payouts` compound unique index** — blocked by historical duplicates; will install cleanly after Phase 2D data cleanup.
+- **`partner_recovery_ledger.(source_payout_id)` index** — deferred to Phase 2B per authorization.
+- **Bundle D** — `GET /api/health/build`, `BUILD_COMMIT_SHA` propagation, docstring cleanup, cosmetic observability. Explicitly excluded from this sprint.
+- **ORPHAN-PAY-001** — 55 dangling top-level payments on Preview. Reconciliation deferred to Phase 2D.
+- **REC-AUTO-001** — automatic recovery-ledger emission from atomic refund/cancel paths. Deferred to Phase 2B.
+- **F-14** — cancel-disallowed-when-`refunded_total > 0` invariant. Deferred to a future NAV.
+- **NAV-013 and beyond** — NOT started. Do NOT start automatically. Explicit future authorization from the user is required.
+
+**No further NAV-012 work planned. Phase 2B not started. Phase 2D not started. NAV-013 not started. Historical payout reconciliation, historical invoice cleanup, orphan-payment reconciliation, unique compound index creations, NAV-008 counter reconciliation, `(source_payout_id)` index, Bundle D, auto-recovery emission — all NOT STARTED — each requires explicit future authorization from the user.**
+
+
 ## 🏁 NAV-011 — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview regression, Preview/code-level financial-data-plane clarification, manual Production deployment, and read-only Production post-deployment verification.
