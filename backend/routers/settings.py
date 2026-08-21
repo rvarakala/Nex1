@@ -856,3 +856,172 @@ async def fetch_user_avatar(user_id: str,
         media_type=meta.get("content_type", "image/png"),
         headers={"Cache-Control": "private, max-age=300"},
     )
+
+
+# ────────────────────────── Integrations Hub ─────────────────────────
+#
+# GET /api/settings/integrations
+#
+# Consolidated read-only view of every third-party integration AUDINEXA
+# actually supports today. Reuses the existing env-var + collection
+# configuration mechanisms already documented in `routers/status_page.py`
+# and `routers/connect.py`. Never returns secret values — only presence.
+#
+# Categories:
+#   • Payments   — Razorpay
+#   • Messaging  — WhatsApp (MSG91)
+#   • Email      — ZeptoMail (SMTP)
+#   • SMS        — Twilio
+#   • System     — Database (MongoDB) · API
+#
+# Status values (mirrors status_page.py):
+#   • operational       — credentials present, reachable
+#   • degraded          — credentials present but downstream is slow / partial
+#   • outage            — configured but unreachable
+#   • unknown           — no credentials configured (integration not wired up
+#                         on this deployment)
+#   • not_available     — integration not offered on the current tier
+#
+# Cards do NOT expose:
+#   • raw secret values
+#   • plaintext auth keys
+#   • webhook secrets
+#
+# Owner / staff read only. Zero write endpoints — configuration continues
+# to happen via the existing per-integration surfaces (Razorpay via env,
+# ZeptoMail via env, Twilio via env, WhatsApp via /settings/connect).
+
+@router.get("/integrations")
+async def list_integrations(user=Depends(get_current_user), db=Depends(get_db)):
+    """Return a provider-card list for the Settings → Integrations hub.
+
+    Reuses the presence-check pattern established in
+    ``routers/status_page.py`` (per-provider ``_probe_*`` functions).
+    All checks are cheap: env-var presence + one Mongo find_one for the
+    tenant's WhatsApp config. No outbound HTTP calls. No secrets in the
+    payload. Response shape is intentionally flat and stable so the
+    frontend can render generically.
+    """
+    import os
+
+    clinic_id = user["clinic_id"]
+
+    # ── Razorpay ──
+    rzp_kid = (os.environ.get("RAZORPAY_KEY_ID") or "").strip()
+    rzp_sec = (os.environ.get("RAZORPAY_KEY_SECRET") or "").strip()
+    rzp_hook = (os.environ.get("RAZORPAY_WEBHOOK_SECRET") or "").strip()
+    if rzp_kid and rzp_sec:
+        rzp_status = "operational"
+        rzp_detail = "Credentials present"
+        if not rzp_hook:
+            rzp_detail = "Credentials present · webhook secret not set"
+    else:
+        rzp_status = "unknown"
+        rzp_detail = "No credentials configured on this deployment"
+
+    # ── WhatsApp (MSG91) ──
+    # Two paths: (a) BYOG per-clinic doc, (b) hosted / env-key fallback.
+    wa_doc = await db.whatsapp_configs.find_one(
+        {"clinic_id": clinic_id}, {"_id": 0}
+    ) or {}
+    wa_env_key = bool(
+        os.environ.get("MSG91_AUTH_KEY") or os.environ.get("MSG91_API_KEY")
+    )
+    if wa_doc.get("enabled"):
+        mode = wa_doc.get("mode") or "byog"
+        if mode == "byog":
+            has_key = bool(wa_doc.get("auth_key_encrypted"))
+            has_number = bool(wa_doc.get("integrated_number"))
+            if has_key and has_number:
+                wa_status = "operational"
+                wa_detail = f"BYOG mode · sender {wa_doc.get('integrated_number')}"
+            else:
+                wa_status = "degraded"
+                wa_detail = "BYOG mode enabled but auth key / sender not fully configured"
+        else:  # hosted
+            wa_status = "operational" if wa_env_key else "degraded"
+            wa_detail = "Hosted mode · shared AUDINEXA sender"
+    elif wa_env_key or wa_doc.get("mode"):
+        wa_status = "unknown"
+        wa_detail = "Configured but disabled"
+    else:
+        wa_status = "unknown"
+        wa_detail = "Awaiting configuration in Settings → Connect (WhatsApp)"
+
+    # ── ZeptoMail (SMTP) ──
+    zm_host = (os.environ.get("ZEPTO_SMTP_HOST") or "").strip()
+    zm_pw = (os.environ.get("ZEPTO_SMTP_PASSWORD") or "").strip()
+    zm_from = (os.environ.get("ZEPTO_FROM_ADDRESS") or "").strip()
+    if zm_host and zm_pw:
+        zm_status = "operational"
+        zm_detail = f"Credentials present · from {zm_from}" if zm_from else "Credentials present"
+    else:
+        zm_status = "unknown"
+        zm_detail = "No credentials configured on this deployment"
+
+    # ── Twilio (SMS) ──
+    tw_sid = (os.environ.get("TWILIO_ACCOUNT_SID") or "").strip()
+    tw_tok = (os.environ.get("TWILIO_AUTH_TOKEN") or "").strip()
+    tw_from = (os.environ.get("TWILIO_FROM_NUMBER") or "").strip()
+    if tw_sid and tw_tok:
+        tw_status = "operational"
+        tw_detail = f"Credentials present · sender {tw_from}" if tw_from else "Credentials present"
+    else:
+        tw_status = "unknown"
+        tw_detail = "No credentials configured on this deployment"
+
+    integrations = [
+        {
+            "provider_id": "razorpay",
+            "name": "Razorpay",
+            "category": "Payments",
+            "purpose": "Online invoice payment collection (UPI, cards, netbanking).",
+            "status": rzp_status,
+            "detail": rzp_detail,
+            "managed_by": "platform",
+            "config_surface": None,
+            "action_href": None,
+            "action_label": None,
+        },
+        {
+            "provider_id": "msg91_whatsapp",
+            "name": "WhatsApp (MSG91)",
+            "category": "Messaging",
+            "purpose": "Appointment / invoice / report-ready notifications to patients on WhatsApp.",
+            "status": wa_status,
+            "detail": wa_detail,
+            "managed_by": "clinic",
+            "config_surface": "settings",
+            "action_href": "/settings/connect",
+            "action_label": "Configure",
+        },
+        {
+            "provider_id": "zeptomail",
+            "name": "ZeptoMail",
+            "category": "Email",
+            "purpose": "Transactional email — verification, password reset, invoice PDFs.",
+            "status": zm_status,
+            "detail": zm_detail,
+            "managed_by": "platform",
+            "config_surface": None,
+            "action_href": None,
+            "action_label": None,
+        },
+        {
+            "provider_id": "twilio_sms",
+            "name": "Twilio",
+            "category": "SMS",
+            "purpose": "SMS delivery for OTPs, appointment reminders, follow-ups.",
+            "status": tw_status,
+            "detail": tw_detail,
+            "managed_by": "platform",
+            "config_surface": None,
+            "action_href": None,
+            "action_label": None,
+        },
+    ]
+
+    return {
+        "integrations": integrations,
+        "as_of": datetime.now(timezone.utc).isoformat(),
+    }

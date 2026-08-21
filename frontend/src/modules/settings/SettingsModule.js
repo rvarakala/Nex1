@@ -11,7 +11,7 @@ import { NavLink, Route, Routes, Navigate, useLocation } from 'react-router-dom'
 import {
   Settings, Building2, Users, MapPin, Pen, ListChecks, ShieldCheck,
   MessageCircle, Clock, CalendarClock, Upload, User, Printer, Stamp,
-  Stethoscope, Menu, X, ChevronDown, Crown,
+  Stethoscope, Menu, X, ChevronDown, Crown, Puzzle,
 } from 'lucide-react';
 import ClinicDetailsTab from './ClinicDetailsTab';
 import StaffSettingsTab from './StaffSettingsTab';
@@ -22,6 +22,7 @@ import MySealTab from './MySealTab';
 import MyProfileTab from './MyProfileTab';
 import SecurityPrivacyTab from './SecurityPrivacyTab';
 import ConnectWhatsAppTab from './ConnectWhatsAppTab';
+import SettingsIntegrationsTab from './SettingsIntegrationsTab';
 import ClinicHoursTab from './ClinicHoursTab';
 import StaffScheduleTab from './StaffScheduleTab';
 import DataImportTab from './DataImportTab';
@@ -58,6 +59,7 @@ export default function SettingsModule() {
         { to: '/settings/clinic-group',     icon: Crown,         label: 'Clinic Group',      testid: 'settings-nav-clinic-group' },
         { to: '/settings/security',         icon: ShieldCheck,   label: 'Security & Privacy',testid: 'settings-nav-security' },
         { to: '/settings/connect',          icon: MessageCircle, label: 'Connect (WhatsApp)',testid: 'settings-nav-connect' },
+        { to: '/settings/integrations',     icon: Puzzle,        label: 'Integrations',      testid: 'settings-nav-integrations' },
         { to: '/settings/import',           icon: Upload,        label: 'Data Import',       testid: 'settings-nav-import' },
         { to: '/settings/templates',        icon: Printer,       label: 'Print Templates',   testid: 'settings-nav-templates' },
       );
@@ -149,6 +151,7 @@ export default function SettingsModule() {
           {isAdmin && <Route path="clinic-group" element={<ClinicGroupTab />} />}
           {isAdmin && <Route path="security" element={<SecurityPrivacyTab />} />}
           {isAdmin && <Route path="connect"  element={<ConnectWhatsAppTab />} />}
+          {isAdmin && <Route path="integrations" element={<SettingsIntegrationsTab />} />}
           {isAdmin && <Route path="import"   element={<DataImportTab />} />}
           {isAdmin && <Route path="templates" element={<PrintTemplatesTab />} />}
           {isAdmin && <Route path="templates/audiogram" element={<BlankAudiogramTemplate />} />}
