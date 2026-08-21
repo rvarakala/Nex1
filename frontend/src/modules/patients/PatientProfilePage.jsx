@@ -14,12 +14,13 @@ import axios from 'axios';
 import {
   ArrowLeft, ArrowRight, Phone, Calendar, Edit, Plus, Activity,
   CalendarDays, StickyNote, Repeat, Receipt, FileText, Wrench,
-  Cake, Heart, Send, GitMerge,
+  Cake, Heart, Send, GitMerge, HandCoins,
 } from 'lucide-react';
 import DpdpaActions from './DpdpaActions';
 import MergePatientsModal from './MergePatientsModal';
 import FamilyChipStrip from './FamilyChipStrip';
 import { useAuth } from '../../AuthContext';
+import AdvanceReceiptModal from '../billing/AdvanceReceiptModal';
 // Naive-UTC-aware datetime helpers — backend stores `datetime.utcnow()`
 // without a `Z` marker, so we MUST convert here to render local time.
 import { parseUtcIso, fmtDate as fmtDateShared, fmtDateTime as fmtDateTimeShared } from '../../utils/datetime';
@@ -32,6 +33,7 @@ const TABS = [
   { id: 'notes',        label: 'Notes',        icon: StickyNote },
   { id: 'followups',    label: 'Follow-ups',   icon: Repeat },
   { id: 'payments',     label: 'Payments',     icon: Receipt },
+  { id: 'advances',     label: 'Advances',     icon: HandCoins },
   { id: 'reports',      label: 'Reports',      icon: FileText },
   { id: 'service',      label: 'Service',      icon: Wrench },
 ];
@@ -93,9 +95,14 @@ export default function PatientProfilePage() {
   const [invoices, setInvoices]         = useState([]);
   const [tickets, setTickets]           = useState([]);
   const [notes, setNotes]               = useState([]);
+  const [advances, setAdvances]         = useState([]); // Advance Receipts (Phase 2A)
+  const [advanceModalOpen, setAdvanceModalOpen] = useState(false);
   const [greetings, setGreetings]       = useState([]); // pending birthday/anniversary
   const [undoables, setUndoables]       = useState([]); // active merge events in their 10-min window
   const [loading, setLoading]           = useState(true);
+
+  const canCreateAdvance = !!user && ['front_desk', 'accounts', 'clinic_owner', 'super_admin', 'founder'].includes(user.role);
+  const canVoidAdvance = !!user && ['accounts', 'clinic_owner', 'super_admin', 'founder'].includes(user.role);
 
   // Undoable merges are fetched separately (and refreshed on 30s tick)
   // so a stale banner clears itself when the window expires without a
@@ -121,7 +128,7 @@ export default function PatientProfilePage() {
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const [p, ap, ses, inv, tk, nt, gr] = await Promise.all([
+      const [p, ap, ses, inv, tk, nt, gr, adv] = await Promise.all([
         axios.get(`${API}/patients/${patientId}`).then(r => r.data).catch(() => null),
         axios.get(`${API}/appointments?patient_id=${patientId}`).then(r => r.data).catch(() => []),
         axios.get(`${API}/sessions?patient_id=${patientId}`).then(r => r.data).catch(() => []),
@@ -139,6 +146,8 @@ export default function PatientProfilePage() {
           const all = [...(r.data?.today || []), ...(r.data?.upcoming || [])];
           return all.filter(g => g.patient_id === patientId);
         }).catch(() => []),
+        // Advance Receipts (Phase 2A) — scoped to this patient.
+        axios.get(`${API}/advance-receipts?patient_id=${patientId}`).then(r => r.data?.items || []).catch(() => []),
       ]);
       setPatient(p);
       setAppointments(Array.isArray(ap) ? ap : []);
@@ -147,6 +156,7 @@ export default function PatientProfilePage() {
       setTickets(Array.isArray(tk) ? tk : []);
       setNotes(Array.isArray(nt) ? nt : []);
       setGreetings(gr);
+      setAdvances(Array.isArray(adv) ? adv : []);
     } finally { setLoading(false); }
   }, [patientId]);
   useEffect(() => { load(); }, [load]);
@@ -410,12 +420,30 @@ export default function PatientProfilePage() {
         {tab === 'notes' && <NotesTab rows={notes} />}
         {tab === 'followups' && <FollowupsTab rows={appointments.filter(isFollowupAppointment)} />}
         {tab === 'payments' && <PaymentsTab invoices={invoices} />}
+        {tab === 'advances' && (
+          <AdvancesTab
+            rows={advances}
+            canCreate={canCreateAdvance}
+            canVoid={canVoidAdvance}
+            onCreate={() => setAdvanceModalOpen(true)}
+            onChanged={load}
+          />
+        )}
         {tab === 'reports' && <ReportsTab sessions={sessions} tickets={tickets} />}
         {tab === 'service' && <ServiceTab tickets={tickets} />}
 
         {/* Owner-only DPDPA actions — collapsed by default */}
         <DpdpaActions patient={patient} />
       </div>
+
+      {advanceModalOpen && patient && (
+        <AdvanceReceiptModal
+          open={advanceModalOpen}
+          patient={patient}
+          onClose={() => setAdvanceModalOpen(false)}
+          onSuccess={load}
+        />
+      )}
     </div>
   );
 }
@@ -558,10 +586,116 @@ const FollowupsTab = ({ rows }) => {
     </div>
   );
 };
+const AdvancesTab = ({ rows = [], canCreate, canVoid, onCreate, onChanged }) => {
+  const activeTotal = rows.filter((r) => r.status === 'active')
+    .reduce((sum, r) => sum + Number(r.received_amount || 0), 0);
+
+  const openReceipt = (rid) => {
+    window.open(`${API}/advance-receipts/${rid}/receipt.pdf`, '_blank', 'noopener,noreferrer');
+  };
+
+  const voidReceipt = async (rid, rno) => {
+    // eslint-disable-next-line no-alert
+    const reason = window.prompt(`Void ${rno}?\nPlease enter a reason (mandatory):`);
+    if (!reason || reason.trim().length < 3) return;
+    try {
+      await axios.post(`${API}/advance-receipts/${rid}/void`, { reason: reason.trim() });
+      onChanged?.();
+    } catch (e) {
+      // eslint-disable-next-line no-alert
+      alert('Could not void: ' + (e?.response?.data?.detail || e.message));
+    }
+  };
+
+  return (
+    <div data-testid="profile-advances-tab" className="space-y-3">
+      <div className="flex items-center justify-between">
+        <div>
+          <div className="text-[11px] uppercase tracking-wider text-slate-500 font-semibold">Active advances</div>
+          <div className="text-lg font-bold text-emerald-700" data-testid="advances-active-total">
+            ₹{activeTotal.toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}
+          </div>
+        </div>
+        {canCreate && (
+          <button
+            onClick={onCreate}
+            data-testid="profile-advances-new-btn"
+            className="inline-flex items-center gap-2 px-3 py-1.5 bg-sky-600 text-white text-[12px] font-semibold rounded-lg hover:bg-sky-700 transition shadow-sm"
+          >
+            <Plus size={13} /> Receive Advance
+          </button>
+        )}
+      </div>
+      {rows.length === 0 ? (
+        <Empty msg="No advance receipts yet for this patient." />
+      ) : (
+        <div className="bg-white border border-slate-200 rounded-xl overflow-hidden">
+          <table className="w-full text-[12.5px]">
+            <thead className="bg-slate-50 text-slate-500 uppercase text-[10px] font-bold tracking-wider">
+              <tr>
+                <th className="text-left px-4 py-2.5">Receipt #</th>
+                <th className="text-left px-4 py-2.5">Date</th>
+                <th className="text-right px-4 py-2.5">Amount</th>
+                <th className="text-left px-4 py-2.5">Method</th>
+                <th className="text-left px-4 py-2.5">Purpose</th>
+                <th className="text-left px-4 py-2.5">Status</th>
+                <th className="px-4 py-2.5"></th>
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((r, i) => (
+                <tr key={r.receipt_id} className="border-t border-slate-100" data-testid={`profile-advances-row-${i}`}>
+                  <td className="px-4 py-2.5 font-mono text-[11px]">{r.receipt_no}</td>
+                  <td className="px-4 py-2.5">{fmtDateTime(r.received_at)}</td>
+                  <td className="px-4 py-2.5 text-right tabular-nums font-bold text-slate-900">
+                    ₹{Number(r.received_amount || 0).toLocaleString('en-IN', { maximumFractionDigits: 2, minimumFractionDigits: 2 })}
+                  </td>
+                  <td className="px-4 py-2.5 capitalize text-slate-700">{String(r.method || '').replace('_', ' ')}</td>
+                  <td className="px-4 py-2.5 text-slate-600 text-[11.5px]">{r.purpose_note || '—'}</td>
+                  <td className="px-4 py-2.5">
+                    <span
+                      className={`text-[10px] px-1.5 py-0.5 font-bold rounded border uppercase tracking-wider ${
+                        r.status === 'voided'
+                          ? 'bg-rose-100 text-rose-700 border-rose-300 line-through'
+                          : 'bg-emerald-100 text-emerald-800 border-emerald-300'
+                      }`}
+                      data-testid={`profile-advances-status-${i}`}
+                    >
+                      {r.status}
+                    </span>
+                  </td>
+                  <td className="px-4 py-2.5 text-right space-x-1 whitespace-nowrap">
+                    <button
+                      onClick={() => openReceipt(r.receipt_id)}
+                      data-testid={`profile-advances-print-btn-${i}`}
+                      className="text-[11px] text-sky-700 hover:text-sky-900 font-semibold"
+                    >
+                      Print →
+                    </button>
+                    {canVoid && r.status === 'active' && (
+                      <button
+                        onClick={() => voidReceipt(r.receipt_id, r.receipt_no)}
+                        data-testid={`profile-advances-void-btn-${i}`}
+                        className="text-[11px] text-rose-700 hover:text-rose-900 font-semibold ml-2"
+                      >
+                        Void
+                      </button>
+                    )}
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        </div>
+      )}
+    </div>
+  );
+};
+
+
 
 const PaymentsTab = ({ invoices }) => {
-  if (!invoices.length) return <Empty msg="No invoices yet." />;
-  return (
+  if (!invoices.length) return <Empty msg="No invoices yet." />;  return (
     <div className="bg-white border border-slate-200 rounded-xl overflow-hidden" data-testid="profile-payments-tab">
       <table className="w-full text-[12.5px]">
         <thead className="bg-slate-50 text-slate-500 uppercase text-[10px] font-bold tracking-wider">

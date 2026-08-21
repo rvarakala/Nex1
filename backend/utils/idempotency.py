@@ -66,7 +66,7 @@ STALE_THRESHOLD_SECONDS = 90
 # TTL for the idempotency record itself (from create_at) — 24 hours.
 TTL_SECONDS = 24 * 3600
 
-SUPPORTED_SCOPES = ("payment", "refund", "payout")
+SUPPORTED_SCOPES = ("payment", "refund", "payout", "advance_receipt")
 
 
 def _now_utc() -> datetime:

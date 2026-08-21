@@ -331,6 +331,26 @@ async def lifespan(_app: FastAPI):
             [("expires_at", 1)],
             name="idem_expires_ttl", expireAfterSeconds=0,
         )
+        # Advance Receipts · Phase 2A (Receipt-only).
+        # Isolated collections — no cross-linking to invoices / payments.
+        # (clinic_id, receipt_no) is UNIQUE per tenant per year via the
+        # AR/YYYY/NNNNNN counter. `receipt_id` is globally unique.
+        await db.advance_receipts.create_index("receipt_id", unique=True)
+        await db.advance_receipts.create_index(
+            [("clinic_id", 1), ("receipt_no", 1)],
+            unique=True, name="uniq_clinic_advance_receipt_no",
+        )
+        await db.advance_receipts.create_index(
+            [("clinic_id", 1), ("patient_id", 1), ("created_at", -1)],
+            name="ar_clinic_patient_ct",
+        )
+        await db.advance_receipts.create_index(
+            [("clinic_id", 1), ("status", 1), ("created_at", -1)],
+            name="ar_clinic_status_ct",
+        )
+        await db.advance_audit_events.create_index("event_id", unique=True)
+        await db.advance_audit_events.create_index([("receipt_id", 1), ("at", -1)])
+        await db.advance_audit_events.create_index([("clinic_id", 1), ("at", -1)])
         # Patient Portal (M13, Phase 13.D)
         await db.patient_otps.create_index([("clinic_id", 1), ("patient_id", 1)], unique=True)
         await db.patient_appointment_requests.create_index("request_id", unique=True)
@@ -1159,6 +1179,7 @@ from routers import marketing_traffic as marketing_traffic_router  # noqa: E402
 from routers import csv_email_exports as csv_email_exports_router # noqa: E402
 from routers import hearing_report_versions as hearing_report_versions_router  # noqa: E402
 from routers import launch_banner as launch_banner_router  # noqa: E402
+from routers import advance_receipts as advance_receipts_router  # noqa: E402
 
 app.include_router(closeouts_router.router)
 app.include_router(reports_router.router)
@@ -1225,6 +1246,7 @@ app.include_router(ha_quick_sale_router.router)
 app.include_router(ha_ear_moulds_router.router)
 app.include_router(ha_custom_ha_orders_router.router)
 app.include_router(marketing_traffic_router.router)
+app.include_router(advance_receipts_router.router)
 
 # ---- CORS lockdown ----
 # Production SHOULD set CORS_ORIGINS to a comma-separated list of allowed origins

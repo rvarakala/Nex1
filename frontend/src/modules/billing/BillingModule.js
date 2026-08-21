@@ -6,6 +6,7 @@ import CreateInvoicePage from './CreateInvoicePage';
 import PaymentsRefundsPage from './PaymentsRefundsPage';
 import ServiceCatalogPage from './ServiceCatalogPage';
 import MySubscriptionPage from './MySubscriptionPage';
+import AdvanceReceiptsPage from './AdvanceReceiptsPage';
 import { useAuth } from '../../AuthContext';
 
 const Tab = ({ to, label, testid }) => {
@@ -42,6 +43,7 @@ export default function BillingModule() {
         <h2 className="text-sm font-bold text-slate-800 mr-3 shrink-0">Billing</h2>
         <Tab to="/billing" testid="bill-tab-invoices" label="Invoices" />
         <Tab to="/billing/new" testid="bill-tab-new" label="+ New Invoice" />
+        <Tab to="/billing/advances" testid="bill-tab-advances" label="Advances" />
         <Tab to="/billing/payments" testid="bill-tab-payments" label="Payments & Refunds" />
         {canManageCatalog && <Tab to="/billing/catalog" testid="bill-tab-catalog" label="Service Catalog" />}
         {canSeeSubscription && <Tab to="/billing/my-subscription" testid="bill-tab-my-sub" label="My Subscription" />}
@@ -51,6 +53,7 @@ export default function BillingModule() {
         <Routes>
           <Route index element={<InvoicesListPage />} />
           <Route path="new" element={<CreateInvoicePage />} />
+          <Route path="advances" element={<AdvanceReceiptsPage />} />
           <Route path="payments" element={<PaymentsRefundsPage />} />
           <Route path="invoice/:invoiceId" element={<InvoiceDetailPage />} />
           <Route
