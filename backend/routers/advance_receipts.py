@@ -264,7 +264,7 @@ async def create_advance_receipt(
 @router.get("")
 async def list_advance_receipts(
     patient_id: Optional[str] = Query(default=None),
-    status: Optional[str] = Query(default=None, regex=r"^(active|voided)$"),
+    status: Optional[str] = Query(default=None, pattern=r"^(active|voided)$"),
     date_from: Optional[str] = Query(default=None, description="ISO date"),
     date_to: Optional[str] = Query(default=None, description="ISO date"),
     limit: int = Query(default=100, ge=1, le=500),

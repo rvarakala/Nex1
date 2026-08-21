@@ -13,6 +13,7 @@ import axios from 'axios';
 import { Link } from 'react-router-dom';
 import { Plus, Ear, Search, Calendar, Package, RefreshCw } from 'lucide-react';
 import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
+import InlineApplyAdvancePanel, { preflightAdvance, allocateAdvance } from '../billing/InlineApplyAdvancePanel';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -304,6 +305,9 @@ function BookEarMouldModal({ onClose, onSaved }) {
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  // Phase 2B.3 · Inline Apply-Advance state
+  const [applyAdv, setApplyAdv] = useState({ enabled: false, receiptId: null, amount: '' });
+  const [advWarning, setAdvWarning] = useState('');
 
   // Patient search — debounced.
   useEffect(() => {
@@ -326,14 +330,40 @@ function BookEarMouldModal({ onClose, onSaved }) {
 
   const submit = async () => {
     setErr('');
+    setAdvWarning('');
     if (!patient) { setErr('Pick a patient'); return; }
     if (!total || Number(total) <= 0) { setErr('Enter the total amount'); return; }
     if (Number(advance || 0) > Number(total)) {
       setErr('Advance cannot exceed the total'); return;
     }
+
+    // Phase 2B.3 · Inline Apply-Advance validation
+    let advToApply = null;
+    if (applyAdv.enabled) {
+      if (!applyAdv.receiptId) { setErr('Pick an advance receipt to apply.'); return; }
+      const amt = Number(applyAdv.amount);
+      if (!Number.isFinite(amt) || amt <= 0) { setErr('Apply-Advance amount must be > 0.'); return; }
+      const cashPortion = Number(advance || 0);
+      if (amt + cashPortion > Number(total) + 0.5) {
+        setErr(`Advance (₹${amt}) + cash advance (₹${cashPortion}) exceeds total (₹${total}). Reduce one.`);
+        return;
+      }
+      advToApply = { receiptId: applyAdv.receiptId, amount: amt };
+    }
+
     setBusy(true);
     try {
-      await axios.post(`${API}/ha/ear-moulds`, {
+      // Pre-flight advance check
+      if (advToApply) {
+        try {
+          await preflightAdvance(advToApply);
+        } catch (pf) {
+          setErr(pf.message || 'Advance pre-flight failed');
+          setBusy(false);
+          return;
+        }
+      }
+      const emResp = await axios.post(`${API}/ha/ear-moulds`, {
         patient_id: patient.patient_id,
         side,
         material,
@@ -349,6 +379,22 @@ function BookEarMouldModal({ onClose, onSaved }) {
         gst_rate: Number(gst || 0),
         notes: notes || null,
       });
+      // Phase 2B.3 · Post-allocation via authoritative Phase 2B.2 writer
+      if (advToApply && emResp.data?.invoice_id) {
+        try {
+          await allocateAdvance({
+            receiptId: advToApply.receiptId,
+            invoiceId: emResp.data.invoice_id,
+            amount: advToApply.amount,
+          });
+        } catch (allocErr) {
+          const detail = allocErr?.response?.data?.detail || allocErr?.message || 'Advance allocation failed';
+          setAdvWarning(
+            `Ear mould order ${emResp.data.order_no || ''} was created, but the advance could not be applied: ${detail}. ` +
+            `The invoice remains open at its full balance. Retry via Advance Receipts.`,
+          );
+        }
+      }
       onSaved?.();
     } catch (e) {
       const d = e?.response?.data?.detail;
@@ -427,6 +473,22 @@ function BookEarMouldModal({ onClose, onSaved }) {
           {/* Phase 2B.3 · Advance-availability alert. Informational. */}
           {patient?.patient_id && (
             <PatientAdvancesBanner patientId={patient.patient_id} />
+          )}
+          {advWarning && (
+            <div className="bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded px-3 py-2" data-testid="em-apply-advance-warning">
+              {advWarning}
+            </div>
+          )}
+          {/* Phase 2B.3 (UX Correction) · Inline Apply-Advance panel */}
+          {patient?.patient_id && (
+            <InlineApplyAdvancePanel
+              patientId={patient.patient_id}
+              salePrice={Number(total) || 0}
+              value={applyAdv}
+              onChange={setApplyAdv}
+              disabled={busy}
+              testidPrefix="em-apply-advance"
+            />
           )}
 
           {/* Side + material row */}

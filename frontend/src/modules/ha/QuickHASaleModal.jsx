@@ -8,6 +8,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 import HASpecPicker from '../../components/HASpecPicker';
 import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
+import InlineApplyAdvancePanel, { preflightAdvance, allocateAdvance } from '../billing/InlineApplyAdvancePanel';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -89,6 +90,12 @@ export default function QuickHASaleModal({
   // Live inventory lookup state per side: {status, reason, state}
   // status: 'available' | 'conflict' | 'not_found' | 'checking' | null
   const [serialState, setSerialState] = useState({ left: null, right: null });
+
+  // Phase 2B.3 · Inline Apply-Advance state. `enabled` toggles the panel;
+  // `receiptId` + `amount` are captured from the picker. On submit we
+  // (1) pre-flight the advance, (2) create the sale, (3) POST allocation.
+  const [applyAdv, setApplyAdv] = useState({ enabled: false, receiptId: null, amount: '' });
+  const [advWarning, setAdvWarning] = useState('');
 
   // When the audiologist toggles Side (both ↔ left ↔ right) the spec
   // shape must follow — flat for single-ear, {left, right} for both.
@@ -214,8 +221,37 @@ export default function QuickHASaleModal({
       if (!Number.isFinite(adv) || adv <= 0) { setErr('Advance amount required when "Advance paid".'); return; }
       if (adv > sale + 0.5) { setErr('Advance cannot exceed sale price.'); return; }
     }
+
+    // Phase 2B.3 · Inline Apply-Advance validation
+    let advToApply = null;
+    if (applyAdv.enabled) {
+      if (!applyAdv.receiptId) { setErr('Pick an advance receipt to apply.'); return; }
+      const amt = Number(applyAdv.amount);
+      if (!Number.isFinite(amt) || amt <= 0) { setErr('Apply-Advance amount must be > 0.'); return; }
+      // Combined ceiling: initial cash payment + advance ≤ sale price.
+      const cashPortion = form.payment_status === 'fully_paid' ? sale
+        : (form.payment_status === 'advance_paid' ? Number(form.advance_amount || 0) : 0);
+      if (amt + cashPortion > sale + 0.5) {
+        setErr(`Advance (₹${amt}) + cash payment (₹${cashPortion}) exceeds sale price (₹${sale}). Reduce one.`);
+        return;
+      }
+      advToApply = { receiptId: applyAdv.receiptId, amount: amt };
+    }
     setSaving(true);
+    setAdvWarning('');
     try {
+      // Pre-flight: re-fetch the selected receipt right before writing.
+      // Fails fast if a concurrent user consumed the balance. No invoice
+      // is created until this passes.
+      if (advToApply) {
+        try {
+          await preflightAdvance(advToApply);
+        } catch (pf) {
+          setErr(pf.message || 'Advance pre-flight failed');
+          setSaving(false);
+          return;
+        }
+      }
       const body = {
         patient_id: picked.patient_id,
         branch_id: form.branch_id,
@@ -246,6 +282,28 @@ export default function QuickHASaleModal({
         spec: spec && Object.keys(spec).length ? spec : null,
       };
       const r = await axios.post(`${API}/ha/quick-sale`, body);
+      // Phase 2B.3 · Post-allocation. The sale endpoint returned the
+      // freshly-created invoice_id. We call the authoritative Phase 2B.2
+      // writer to record the advance as a payment on that invoice.
+      // On failure: the invoice EXISTS unmodified (grand_total preserved,
+      // no phantom advance payment). We surface a clear warning so staff
+      // can apply the advance manually via the Advance Receipts screen.
+      if (advToApply && r.data?.invoice_id) {
+        try {
+          await allocateAdvance({
+            receiptId: advToApply.receiptId,
+            invoiceId: r.data.invoice_id,
+            amount: advToApply.amount,
+          });
+        } catch (allocErr) {
+          const detail = allocErr?.response?.data?.detail || allocErr?.message || 'Advance allocation failed';
+          setAdvWarning(
+            `Sale ${r.data.sale_no || r.data.invoice_no || ''} was created, but the advance could not be applied: ${detail}. ` +
+            `The invoice remains open at its full balance. Open Advance Receipts → click "Apply Advance" on the new invoice to retry.`,
+          );
+          // Deliberately still call onCreated — the sale itself succeeded.
+        }
+      }
       onCreated && onCreated(r.data);
     } catch (e) {
       const d = e?.response?.data?.detail;
@@ -271,6 +329,11 @@ export default function QuickHASaleModal({
 
         <div className="p-5 space-y-5">
           {err && <div className="bg-rose-50 border border-rose-200 text-rose-700 text-xs rounded px-3 py-2" data-testid="quick-ha-err">{err}</div>}
+          {advWarning && (
+            <div className="bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded px-3 py-2" data-testid="qha-apply-advance-warning">
+              {advWarning}
+            </div>
+          )}
 
           {/* Patient + Branch */}
           <section>
@@ -319,6 +382,24 @@ export default function QuickHASaleModal({
             {picked?.patient_id && (
               <div className="mt-3">
                 <PatientAdvancesBanner patientId={picked.patient_id} />
+              </div>
+            )}
+            {/* Phase 2B.3 (UX Correction) · Inline Apply-Advance panel.
+                Renders inside the sale form so staff can wire the
+                advance in one shot — no navigation. Fails fast if the
+                advance balance drifted during entry (pre-flight),
+                otherwise applies AFTER the sale invoice exists via the
+                authoritative Phase 2B.2 writer. */}
+            {picked?.patient_id && (
+              <div className="mt-3">
+                <InlineApplyAdvancePanel
+                  patientId={picked.patient_id}
+                  salePrice={parseFloat(form.sale_price) || 0}
+                  value={applyAdv}
+                  onChange={setApplyAdv}
+                  disabled={saving}
+                  testidPrefix="qha-apply-advance"
+                />
               </div>
             )}
           </section>

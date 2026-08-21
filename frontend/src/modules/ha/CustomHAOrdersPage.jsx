@@ -15,6 +15,7 @@ import axios from 'axios';
 import { Link } from 'react-router-dom';
 import { Plus, Ear, Search, Calendar, Package, RefreshCw, Building2, Truck, Paperclip, X } from 'lucide-react';
 import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
+import InlineApplyAdvancePanel, { preflightAdvance, allocateAdvance } from '../billing/InlineApplyAdvancePanel';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -461,6 +462,10 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
 
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState('');
+  // Phase 2B.3 · Inline Apply-Advance state — apply an existing Advance
+  // Receipt as a payment on the freshly-created invoice.
+  const [applyAdv, setApplyAdv] = useState({ enabled: false, receiptId: null, amount: '' });
+  const [advWarning, setAdvWarning] = useState('');
   // Audiogram picked at booking time — sent as a second multipart POST
   // right after the JSON order is created so the head owner sees the
   // "View Audiogram" button in their inbox the moment the request lands.
@@ -547,6 +552,7 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
 
   const submit = async () => {
     setErr('');
+    setAdvWarning('');
     if (!patient) { setErr('Pick a patient'); return; }
     if (!shellType) { setErr('Pick a shell type'); return; }
     if (!total || Number(total) <= 0) { setErr('Enter the total amount'); return; }
@@ -558,8 +564,32 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
     const routesToHead = deliveryTarget === 'branch' && groupInfo.inGroup && !groupInfo.isHead;
     if (deliveryTarget === 'branch' && !routesToHead && !targetBranchId) { setErr('Pick a target branch'); return; }
 
+    // Phase 2B.3 · Inline Apply-Advance validation
+    let advToApply = null;
+    if (applyAdv.enabled) {
+      if (!applyAdv.receiptId) { setErr('Pick an advance receipt to apply.'); return; }
+      const amt = Number(applyAdv.amount);
+      if (!Number.isFinite(amt) || amt <= 0) { setErr('Apply-Advance amount must be > 0.'); return; }
+      const cashPortion = Number(advance || 0);
+      if (amt + cashPortion > Number(total) + 0.5) {
+        setErr(`Advance (₹${amt}) + cash advance (₹${cashPortion}) exceeds total (₹${total}). Reduce one.`);
+        return;
+      }
+      advToApply = { receiptId: applyAdv.receiptId, amount: amt };
+    }
+
     setBusy(true);
     try {
+      // Pre-flight: re-fetch the selected receipt right before writing.
+      if (advToApply) {
+        try {
+          await preflightAdvance(advToApply);
+        } catch (pf) {
+          setErr(pf.message || 'Advance pre-flight failed');
+          setBusy(false);
+          return;
+        }
+      }
       const orderResp = await axios.post(`${API}/ha/custom-ha-orders`, {
         patient_id: patient.patient_id,
         side,
@@ -607,6 +637,24 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
           // Booking succeeded — flag the audiogram error but don't
           // block the caller since they can retry via the list row.
           console.warn('Audiogram upload failed', audioErr);
+        }
+      }
+      // Phase 2B.3 · Post-allocation. The order endpoint returned the
+      // freshly-created invoice_id. On failure the invoice EXISTS
+      // untouched — staff can retry manually via Advance Receipts.
+      if (advToApply && orderResp.data?.invoice_id) {
+        try {
+          await allocateAdvance({
+            receiptId: advToApply.receiptId,
+            invoiceId: orderResp.data.invoice_id,
+            amount: advToApply.amount,
+          });
+        } catch (allocErr) {
+          const detail = allocErr?.response?.data?.detail || allocErr?.message || 'Advance allocation failed';
+          setAdvWarning(
+            `Order ${orderResp.data.order_no || ''} was created, but the advance could not be applied: ${detail}. ` +
+            `The invoice remains open at its full balance. Retry via Advance Receipts.`,
+          );
         }
       }
       onSaved?.();
@@ -690,6 +738,22 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
           {/* Phase 2B.3 · Advance-availability alert. Informational. */}
           {patient?.patient_id && (
             <PatientAdvancesBanner patientId={patient.patient_id} />
+          )}
+          {advWarning && (
+            <div className="bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded px-3 py-2" data-testid="cha-apply-advance-warning">
+              {advWarning}
+            </div>
+          )}
+          {/* Phase 2B.3 (UX Correction) · Inline Apply-Advance panel */}
+          {patient?.patient_id && (
+            <InlineApplyAdvancePanel
+              patientId={patient.patient_id}
+              salePrice={Number(total) || 0}
+              value={applyAdv}
+              onChange={setApplyAdv}
+              disabled={busy}
+              testidPrefix="cha-apply-advance"
+            />
           )}
 
           {/* Shell type + Side */}

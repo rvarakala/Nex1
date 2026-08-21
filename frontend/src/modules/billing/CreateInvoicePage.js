@@ -5,6 +5,7 @@ import { API, fmtINR, PAYMENT_METHODS } from './billingUtils';
 import AddServiceInlineModal from './AddServiceInlineModal';
 import ErrorToast, { describeError } from '../../components/ErrorToast';
 import LandscapePrompt from '../../components/LandscapePrompt';
+import InlineApplyAdvancePanel, { preflightAdvance, allocateAdvance } from './InlineApplyAdvancePanel';
 
 // Compute totals client-side (mirrors backend logic) for live preview.
 function resolveDiscount(line, gross) {
@@ -63,6 +64,9 @@ export default function CreateInvoicePage() {
   const [error, setError] = useState(null);
   const [showAddSvc, setShowAddSvc] = useState(false);
   const [prefillBanner, setPrefillBanner] = useState(null); // { sale_no, alreadyInvoiced?, invoiceNo? }
+  // Phase 2B.3 · Inline Apply-Advance
+  const [applyAdv, setApplyAdv] = useState({ enabled: false, receiptId: null, amount: '' });
+  const [advWarning, setAdvWarning] = useState('');
 
   useEffect(() => {
     axios.get(`${API}/billing/services`).then((r) => setServices(r.data || [])).catch(() => {});
@@ -259,8 +263,36 @@ export default function CreateInvoicePage() {
 
   const submit = async () => {
     if (!valid) return;
-    setSaving(true); setError(null);
+    setSaving(true); setError(null); setAdvWarning('');
+
+    // Phase 2B.3 · Inline Apply-Advance validation
+    let advToApply = null;
+    if (applyAdv.enabled) {
+      if (!applyAdv.receiptId) {
+        setError('Pick an advance receipt to apply.'); setSaving(false); return;
+      }
+      const amt = Number(applyAdv.amount);
+      if (!Number.isFinite(amt) || amt <= 0) {
+        setError('Apply-Advance amount must be > 0.'); setSaving(false); return;
+      }
+      const cashPortion = payNow.enabled ? Number(payNow.amount || 0) : 0;
+      if (amt + cashPortion > Number(totals.rounded || totals.grand) + 0.5) {
+        setError(`Advance (₹${amt}) + cash payment (₹${cashPortion}) exceeds invoice total. Reduce one.`);
+        setSaving(false); return;
+      }
+      advToApply = { receiptId: applyAdv.receiptId, amount: amt };
+    }
+
     try {
+      // Pre-flight advance re-check
+      if (advToApply) {
+        try {
+          await preflightAdvance(advToApply);
+        } catch (pf) {
+          setError(pf.message || 'Advance pre-flight failed');
+          setSaving(false); return;
+        }
+      }
       const body = {
         patient_id: patient.patient_id,
         session_id: preselectSession,
@@ -296,6 +328,23 @@ export default function CreateInvoicePage() {
           : null,
       };
       const r = await axios.post(`${API}/billing/invoices`, body);
+      // Phase 2B.3 · Post-allocation via authoritative Phase 2B.2 writer
+      if (advToApply && r.data?.invoice_id) {
+        try {
+          await allocateAdvance({
+            receiptId: advToApply.receiptId,
+            invoiceId: r.data.invoice_id,
+            amount: advToApply.amount,
+          });
+        } catch (allocErr) {
+          const detail = allocErr?.response?.data?.detail || allocErr?.message || 'Advance allocation failed';
+          setAdvWarning(
+            `Invoice ${r.data.invoice_no || ''} was created, but the advance could not be applied: ${detail}. ` +
+            `The invoice remains open at its full balance. Retry via Advance Receipts.`,
+          );
+          // Still navigate — the invoice EXISTS. The user can retry advance manually.
+        }
+      }
       navigate(`/billing/invoice/${r.data.invoice_id}`);
     } catch (e) {
       setError(describeError(e, 'Failed to create invoice'));
@@ -365,6 +414,25 @@ export default function CreateInvoicePage() {
             </div>
           )}
         </div>
+
+        {/* Phase 2B.3 (UX Correction) · Inline Apply-Advance panel */}
+        {patient?.patient_id && (
+          <div className="bg-white rounded-lg border border-slate-200 p-3">
+            {advWarning && (
+              <div className="mb-2 bg-amber-50 border border-amber-300 text-amber-900 text-xs rounded px-3 py-2" data-testid="ci-apply-advance-warning">
+                {advWarning}
+              </div>
+            )}
+            <InlineApplyAdvancePanel
+              patientId={patient.patient_id}
+              salePrice={Number(totals.rounded || totals.grand) || 0}
+              value={applyAdv}
+              onChange={setApplyAdv}
+              disabled={saving}
+              testidPrefix="ci-apply-advance"
+            />
+          </div>
+        )}
 
         {/* Quick add services */}
         <div className="bg-white rounded-lg border border-slate-200 p-3 space-y-2">
