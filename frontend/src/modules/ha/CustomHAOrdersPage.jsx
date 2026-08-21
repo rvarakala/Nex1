@@ -14,6 +14,7 @@ import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react'
 import axios from 'axios';
 import { Link } from 'react-router-dom';
 import { Plus, Ear, Search, Calendar, Package, RefreshCw, Building2, Truck, Paperclip, X } from 'lucide-react';
+import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -685,6 +686,11 @@ export function CustomHAOrderModal({ onClose, onSaved, defaultTarget = 'vendor',
               </div>
             )}
           </div>
+
+          {/* Phase 2B.3 · Advance-availability alert. Informational. */}
+          {patient?.patient_id && (
+            <PatientAdvancesBanner patientId={patient.patient_id} />
+          )}
 
           {/* Shell type + Side */}
           <div className="grid grid-cols-2 gap-3">

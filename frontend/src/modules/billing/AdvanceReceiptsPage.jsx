@@ -14,8 +14,10 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
-import { Search, Plus, ExternalLink, Ban, RotateCcw } from 'lucide-react';
+import { Search, Plus, ExternalLink, Ban, RotateCcw, IndianRupee, ListChecks } from 'lucide-react';
 import AdvanceReceiptModal from './AdvanceReceiptModal';
+import ApplyAdvanceModal from './ApplyAdvanceModal';
+import AllocationsListModal from './AllocationsListModal';
 import { useAuth } from '../../AuthContext';
 
 const API = process.env.REACT_APP_BACKEND_URL + '/api';
@@ -40,6 +42,10 @@ export default function AdvanceReceiptsPage() {
   const { user } = useAuth();
   const canCreate = ['front_desk', 'accounts', 'clinic_owner', 'super_admin', 'founder'].includes(user?.role);
   const canVoid = ['accounts', 'clinic_owner', 'super_admin', 'founder'].includes(user?.role);
+  // Phase 2B.3 · Apply-Advance RBAC mirrors the Phase 2B.2 allocation
+  // endpoint roles (front_desk / accounts / clinic_owner + platform
+  // bypass). Backend remains authoritative.
+  const canApply = ['front_desk', 'accounts', 'clinic_owner', 'super_admin', 'founder'].includes(user?.role);
 
   const [rows, setRows] = useState([]);
   const [activeTotal, setActiveTotal] = useState(0);
@@ -50,6 +56,9 @@ export default function AdvanceReceiptsPage() {
   const [pickedPatient, setPickedPatient] = useState(null);
   const [patientQuery, setPatientQuery] = useState('');
   const [patientResults, setPatientResults] = useState([]);
+  // Phase 2B.3 · Apply-Advance / View-Allocations modal state
+  const [applyReceipt, setApplyReceipt] = useState(null);
+  const [viewAllocationsReceipt, setViewAllocationsReceipt] = useState(null);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -178,6 +187,7 @@ export default function AdvanceReceiptsPage() {
               <th className="text-left px-3 py-2.5 font-semibold">Receipt #</th>
               <th className="text-left px-3 py-2.5 font-semibold">Patient</th>
               <th className="text-right px-3 py-2.5 font-semibold">Amount</th>
+              <th className="text-right px-3 py-2.5 font-semibold">Available</th>
               <th className="text-left px-3 py-2.5 font-semibold">Method</th>
               <th className="text-left px-3 py-2.5 font-semibold">Received</th>
               <th className="text-left px-3 py-2.5 font-semibold">Status</th>
@@ -186,10 +196,27 @@ export default function AdvanceReceiptsPage() {
           </thead>
           <tbody>
             {loading ? (
-              <tr><td colSpan={7} className="text-center py-8 text-slate-400 italic">Loading…</td></tr>
+              <tr><td colSpan={8} className="text-center py-8 text-slate-400 italic">Loading…</td></tr>
             ) : filtered.length === 0 ? (
-              <tr><td colSpan={7} className="text-center py-10 text-slate-400 italic">No advance receipts yet.</td></tr>
-            ) : filtered.map((r, i) => (
+              <tr><td colSpan={8} className="text-center py-10 text-slate-400 italic">No advance receipts yet.</td></tr>
+            ) : filtered.map((r, i) => {
+              // Phase 2B.3 · derive availability facts from the ledger
+              // fields on the receipt row. `available_balance == null`
+              // means the row is a legacy Phase 2A document (field
+              // absent OR null) — the backend rejects allocation with
+              // a clear 409, so the UI must not offer "Apply Advance"
+              // on those rows.
+              const isLegacy = r.available_balance === null || r.available_balance === undefined;
+              const available = Number(r.available_balance || 0);
+              const allocated = Number(r.allocated_total || 0);
+              const isActive = r.status === 'active';
+              const hasAvailable = isActive && !isLegacy && available > 0.01;
+              const hasAllocations = allocated > 0.01;
+              const isFullyApplied = isActive && !isLegacy && available <= 0.01 && allocated > 0.01;
+              // Void allowed only when: active, not legacy-locked, and
+              // no live allocations (mirrors backend $ifNull CAS).
+              const canVoidRow = canVoid && isActive && allocated <= 0.01;
+              return (
               <tr key={r.receipt_id} className="border-b border-slate-100 hover:bg-slate-50" data-testid={`advance-receipt-row-${i}`}>
                 <td className="px-3 py-2.5 font-mono text-[12px] text-slate-800">{r.receipt_no}</td>
                 <td className="px-3 py-2.5">
@@ -202,6 +229,18 @@ export default function AdvanceReceiptsPage() {
                   {r.patient_mobile && <div className="text-[11px] text-slate-500">{r.patient_mobile}</div>}
                 </td>
                 <td className="px-3 py-2.5 text-right font-bold text-slate-900">{fmtINR(r.received_amount)}</td>
+                <td className="px-3 py-2.5 text-right" data-testid={`advance-receipt-available-${i}`}>
+                  {isLegacy ? (
+                    <span className="text-[10px] px-1.5 py-0.5 font-semibold rounded border border-amber-300 bg-amber-50 text-amber-800 uppercase tracking-wider" title="Legacy Phase 2A receipt — needs controlled backfill before it can be allocated.">Legacy</span>
+                  ) : isFullyApplied ? (
+                    <span className="text-[10px] px-1.5 py-0.5 font-semibold rounded border border-slate-300 bg-slate-100 text-slate-600 uppercase tracking-wider">Fully Applied</span>
+                  ) : (
+                    <span className={`font-bold ${hasAvailable ? 'text-emerald-700' : 'text-slate-400'}`}>{fmtINR(available)}</span>
+                  )}
+                  {hasAllocations && !isLegacy && (
+                    <div className="text-[10px] text-indigo-600 mt-0.5">applied {fmtINR(allocated)}</div>
+                  )}
+                </td>
                 <td className="px-3 py-2.5 capitalize text-slate-700">{String(r.method || '').replace('_', ' ')}</td>
                 <td className="px-3 py-2.5 text-slate-600 text-[12px]">{fmtDateTime(r.received_at)}</td>
                 <td className="px-3 py-2.5">
@@ -209,7 +248,7 @@ export default function AdvanceReceiptsPage() {
                     {r.status}
                   </span>
                 </td>
-                <td className="px-3 py-2.5 text-right space-x-1">
+                <td className="px-3 py-2.5 text-right space-x-1 whitespace-nowrap">
                   <button
                     onClick={() => openReceipt(r.receipt_id)}
                     data-testid={`advance-receipt-print-btn-${i}`}
@@ -218,7 +257,27 @@ export default function AdvanceReceiptsPage() {
                   >
                     <ExternalLink size={12} /> Print
                   </button>
-                  {canVoid && r.status === 'active' && (
+                  {canApply && hasAvailable && (
+                    <button
+                      onClick={() => setApplyReceipt(r)}
+                      data-testid={`advance-receipt-apply-btn-${i}`}
+                      className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-emerald-700 hover:text-emerald-900 hover:bg-emerald-50 rounded"
+                      title="Apply this advance to an existing invoice"
+                    >
+                      <IndianRupee size={12} /> Apply Advance
+                    </button>
+                  )}
+                  {hasAllocations && (
+                    <button
+                      onClick={() => setViewAllocationsReceipt(r)}
+                      data-testid={`advance-receipt-view-allocations-btn-${i}`}
+                      className="inline-flex items-center gap-1 px-2 py-1 text-[11px] font-semibold text-indigo-700 hover:text-indigo-900 hover:bg-indigo-50 rounded"
+                      title="View allocation ledger"
+                    >
+                      <ListChecks size={12} /> View Allocations
+                    </button>
+                  )}
+                  {canVoidRow && (
                     <button
                       onClick={() => voidReceipt(r.receipt_id, r.receipt_no)}
                       data-testid={`advance-receipt-void-btn-${i}`}
@@ -230,7 +289,8 @@ export default function AdvanceReceiptsPage() {
                   )}
                 </td>
               </tr>
-            ))}
+              );
+            })}
           </tbody>
         </table>
       </div>
@@ -285,6 +345,23 @@ export default function AdvanceReceiptsPage() {
           patient={pickedPatient}
           onClose={() => { setShowModal(false); setPickedPatient(null); }}
           onSuccess={() => { load(); }}
+        />
+      )}
+
+      {/* Phase 2B.3 · Apply-Advance modal */}
+      {applyReceipt && (
+        <ApplyAdvanceModal
+          receipt={applyReceipt}
+          onClose={() => setApplyReceipt(null)}
+          onApplied={() => { load(); }}
+        />
+      )}
+
+      {/* Phase 2B.3 · View-Allocations modal */}
+      {viewAllocationsReceipt && (
+        <AllocationsListModal
+          receipt={viewAllocationsReceipt}
+          onClose={() => setViewAllocationsReceipt(null)}
         />
       )}
     </div>

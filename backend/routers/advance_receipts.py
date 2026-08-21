@@ -324,6 +324,68 @@ async def get_advance_receipt(
 
 
 # ─────────────────────────────────────────────────────────────────────
+# LIST ALLOCATIONS — GET /api/advance-receipts/{receipt_id}/allocations
+# ─────────────────────────────────────────────────────────────────────
+# Phase 2B.3 (UX) · read-only ledger view over the Phase 2B.2
+# collection. Tenant-scoped. Used by the Apply-Advance UI ("View
+# Allocations" action) and by patient-profile audit trails.
+
+@router.get("/{receipt_id}/allocations")
+async def list_advance_allocations(
+    receipt_id: str,
+    status: Optional[str] = Query(default=None, pattern=r"^(active|voided)$"),
+    limit: int = Query(default=100, ge=1, le=500),
+    user=Depends(require_roles(*READ_ROLES)),
+    db=Depends(get_db),
+):
+    """Return the allocation history for a specific Advance Receipt.
+
+    Response includes both `active` and `voided` allocations by default
+    so the caller can render the full audit trail. Amount aggregates
+    are computed from the ledger, not from the (denormalised) receipt
+    document — the ledger is the source of truth.
+    """
+    # 1. Tenant-scoped receipt lookup (fail-fast 404 if receipt does
+    #    not belong to this clinic).
+    receipt = await db.advance_receipts.find_one(
+        {"receipt_id": receipt_id, "clinic_id": user["clinic_id"]},
+        {"_id": 0, "receipt_id": 1, "receipt_no": 1, "patient_id": 1,
+         "patient_name": 1, "received_amount": 1, "available_balance": 1,
+         "allocated_total": 1, "status": 1},
+    )
+    if not receipt:
+        raise HTTPException(status_code=404, detail="Advance receipt not found")
+
+    # 2. Ledger fetch — status filter is optional.
+    query: dict = {
+        "clinic_id": user["clinic_id"],
+        "advance_receipt_id": receipt_id,
+    }
+    if status:
+        query["status"] = status
+
+    rows = await db.advance_allocations.find(
+        query, {"_id": 0},
+    ).sort("created_at", -1).to_list(limit)
+
+    # 3. Aggregate from the ledger (source of truth).
+    total_active = round(sum(
+        float(r.get("amount") or 0) for r in rows if r.get("status") == "active"
+    ), 2)
+    total_voided = round(sum(
+        float(r.get("amount") or 0) for r in rows if r.get("status") == "voided"
+    ), 2)
+
+    return {
+        "receipt": receipt,
+        "items": rows,
+        "count": len(rows),
+        "total_active_amount": total_active,
+        "total_voided_amount": total_voided,
+    }
+
+
+# ─────────────────────────────────────────────────────────────────────
 # VOID — POST /api/advance-receipts/{receipt_id}/void
 # ─────────────────────────────────────────────────────────────────────
 

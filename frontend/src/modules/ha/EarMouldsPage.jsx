@@ -12,6 +12,7 @@ import React, { useEffect, useMemo, useState, useCallback } from 'react';
 import axios from 'axios';
 import { Link } from 'react-router-dom';
 import { Plus, Ear, Search, Calendar, Package, RefreshCw } from 'lucide-react';
+import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -422,6 +423,11 @@ function BookEarMouldModal({ onClose, onSaved }) {
               </div>
             )}
           </div>
+
+          {/* Phase 2B.3 · Advance-availability alert. Informational. */}
+          {patient?.patient_id && (
+            <PatientAdvancesBanner patientId={patient.patient_id} />
+          )}
 
           {/* Side + material row */}
           <div className="grid grid-cols-3 gap-3">

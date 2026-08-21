@@ -7,6 +7,7 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import axios from 'axios';
 import HASpecPicker from '../../components/HASpecPicker';
+import PatientAdvancesBanner from '../billing/PatientAdvancesBanner';
 
 const API = `${process.env.REACT_APP_BACKEND_URL}/api`;
 
@@ -311,6 +312,15 @@ export default function QuickHASaleModal({
                 </select>
               </Field>
             </div>
+            {/* Phase 2B.3 · alert staff if this patient has an existing
+                unused Advance Receipt. Informational only — clicking
+                opens the Advance Receipts screen where staff apply
+                the advance after this sale creates its invoice. */}
+            {picked?.patient_id && (
+              <div className="mt-3">
+                <PatientAdvancesBanner patientId={picked.patient_id} />
+              </div>
+            )}
           </section>
 
           {/* Hearing aid */}
