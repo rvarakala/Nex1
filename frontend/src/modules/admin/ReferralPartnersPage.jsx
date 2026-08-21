@@ -196,12 +196,36 @@ const PartnerStatsDrawer = ({ partner, onClose }) => {
         </div>
         <div className="p-5 space-y-4 overflow-auto">
           {stats && (
-            <div className="grid grid-cols-4 gap-2">
-              <MiniTile label="Patients" v={stats.stats.patients} />
-              <MiniTile label="Revenue" v={fmtINR(stats.stats.total_revenue)} />
-              <MiniTile label="Est. Commission" v={fmtINR(stats.stats.commission_estimate)} />
-              <MiniTile label="Window" v={`${stats.window_days}d`} />
-            </div>
+            <>
+              <div className="grid grid-cols-4 gap-2">
+                <MiniTile label="Patients" v={stats.stats.patients} />
+                <MiniTile label="Revenue" v={fmtINR(stats.stats.total_revenue)} />
+                <MiniTile label="Est. Commission" v={fmtINR(stats.stats.commission_estimate)} />
+                <MiniTile label="Window" v={`${stats.window_days}d`} />
+              </div>
+              {/* NAV-011 · Phase 2C · Category-aware attribution.
+                  Analytics-only. Existing tiles above are unchanged. */}
+              <div
+                className="grid grid-cols-3 gap-2 pt-1"
+                data-testid="partner-stats-category-attribution"
+              >
+                <MiniTile
+                  label="Diagnostics revenue"
+                  v={fmtINR(stats.stats.diagnostics_revenue || 0)}
+                  testid="partner-stats-diagnostics-revenue"
+                />
+                <MiniTile
+                  label="Hearing Aid revenue"
+                  v={fmtINR(stats.stats.ha_sales_revenue || 0)}
+                  testid="partner-stats-ha-sales-revenue"
+                />
+                <MiniTile
+                  label="Total attributed"
+                  v={fmtINR(stats.stats.total_attributed_revenue || 0)}
+                  testid="partner-stats-total-attributed-revenue"
+                />
+              </div>
+            </>
           )}
 
           <div className="flex items-center justify-between">
@@ -252,8 +276,8 @@ const PartnerStatsDrawer = ({ partner, onClose }) => {
   );
 };
 
-const MiniTile = ({ label, v }) => (
-  <div className="bg-slate-50 rounded p-2 text-center">
+const MiniTile = ({ label, v, testid }) => (
+  <div className="bg-slate-50 rounded p-2 text-center" data-testid={testid}>
     <div className="text-[9px] uppercase tracking-wider text-slate-500 font-semibold">{label}</div>
     <div className="text-sm font-bold text-slate-900 mt-0.5">{v}</div>
   </div>

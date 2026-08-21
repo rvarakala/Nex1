@@ -79,6 +79,29 @@ export default function PartnerPortalPage() {
           <Tile label={partner.commission_kind === 'percent' ? 'Your rate' : 'Your fixed fee'} v={partner.commission_kind === 'percent' ? `${partner.commission_value}%` : fmtINR(partner.commission_value)} tone="slate" />
         </div>
 
+        {/* NAV-011 · Phase 2C · Category-aware attribution.
+            Analytics-only view — the payout above is unaffected. */}
+        <div className="grid grid-cols-1 md:grid-cols-3 gap-3" data-testid="partner-category-attribution">
+          <Tile
+            label="Diagnostics revenue"
+            v={fmtINR(stats.diagnostics_revenue || 0)}
+            tone="sky"
+            testid="partner-diagnostics-revenue"
+          />
+          <Tile
+            label="Hearing Aid / Core Business revenue"
+            v={fmtINR(stats.ha_sales_revenue || 0)}
+            tone="violet"
+            testid="partner-ha-sales-revenue"
+          />
+          <Tile
+            label="Total attributed revenue"
+            v={fmtINR(stats.total_attributed_revenue || 0)}
+            tone="emerald"
+            testid="partner-total-attributed-revenue"
+          />
+        </div>
+
         <div className="grid md:grid-cols-2 gap-5">
           <div className="bg-white border border-slate-200 rounded-lg overflow-hidden" data-testid="partner-patients-card">
             <div className="px-4 py-2 bg-slate-50 border-b text-xs font-bold uppercase tracking-wider text-slate-700">Recent Referred Patients</div>
@@ -130,15 +153,17 @@ export default function PartnerPortalPage() {
   );
 }
 
-const Tile = ({ label, v, tone }) => {
+const Tile = ({ label, v, tone, testid }) => {
   const colorMap = {
     indigo: 'bg-indigo-50 border-indigo-200 text-indigo-900',
     emerald: 'bg-emerald-50 border-emerald-200 text-emerald-900',
     amber: 'bg-amber-50 border-amber-200 text-amber-900',
+    sky: 'bg-sky-50 border-sky-200 text-sky-900',
+    violet: 'bg-violet-50 border-violet-200 text-violet-900',
     slate: 'bg-white border-slate-200 text-slate-900',
   }[tone] || 'bg-slate-50 border-slate-200';
   return (
-    <div className={`rounded-lg p-4 border ${colorMap}`}>
+    <div className={`rounded-lg p-4 border ${colorMap}`} data-testid={testid}>
       <div className="text-[10px] font-semibold uppercase tracking-wider opacity-75">{label}</div>
       <div className="text-2xl font-bold mt-1">{v}</div>
     </div>

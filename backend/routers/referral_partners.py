@@ -209,6 +209,35 @@ async def _attribute_revenue(db, clinic_id: str, partner_id: str,
       * `paid_total` was introduced by NAV-009 · most invoices carry it;
         legacy rows lacking it are treated as 0 (nothing collected).
       * `refunded_total` was introduced by NAV-009 · legacy rows default to 0.
+
+    NAV-011 · Phase 2C — Category-aware attribution (2026-08-21)
+    ------------------------------------------------------------
+    In addition to the pre-existing `invoice_revenue`, `ha_sale_revenue`,
+    and `total_revenue` fields (all preserved for backward compatibility),
+    the response now includes three READ-SIDE analytics-only fields:
+
+      * ``diagnostics_revenue`` — the Diagnostics-Income slice of the
+        invoice net-collected total.
+      * ``ha_sales_revenue`` — the Hearing-Aid / Core-Business slice.
+      * ``total_attributed_revenue`` — the sum of the two mutually-
+        exclusive category buckets.
+
+    Classification rules (identical to the internal-doctor path in
+    ``routers/referrals.py`` — replicated here LOCALLY to satisfy the
+    Phase 2C scope which forbids modifying the internal-doctor code):
+
+      1. If the invoice's linked appointment has ``wing='hearing_aid'``,
+         the ENTIRE invoice contribution is HA. This heals legacy
+         rows whose lines lack ``product_type``.
+      2. Otherwise, per line: HA if ``product_type == 'Hearing Aid'``,
+         Diagnostics otherwise.
+      3. Legacy fallback (invoice has no line breakdown at all): HA
+         if ``is_ha_wing`` OR ``ticket_no`` is set, else Diagnostics.
+      4. Each bucket is scaled by ``net_collected / grand_total`` so
+         the sum of the two buckets equals canonical net-collected.
+
+    Phase 2C is READ-ONLY: no writes, no migration, no schema change,
+    no payout-writer change. Existing fields are NOT modified.
     """
     pat_q = {"clinic_id": clinic_id, "referral_partner_id": partner_id}
     if start or end:
@@ -222,6 +251,11 @@ async def _attribute_revenue(db, clinic_id: str, partner_id: str,
 
     invoice_rev = 0.0
     net_by_invoice: dict[str, float] = {}
+    # NAV-011 · Phase 2C — collect the raw invoice docs we need for the
+    # category-aware pass. We keep the legacy aggregation for
+    # ``invoice_rev`` untouched and do the classification in a small
+    # in-Python second pass so the existing test surface is preserved.
+    invoices_for_classification: list[dict] = []
     if pids:
         async for row in db.invoices.aggregate([
             {"$match": {
@@ -232,6 +266,12 @@ async def _attribute_revenue(db, clinic_id: str, partner_id: str,
             {"$project": {
                 "_id": 0,
                 "invoice_id": 1,
+                # Fields required for category-aware classification.
+                "appointment_id": 1,
+                "grand_total": 1,
+                "rounded_total": 1,
+                "lines": 1,
+                "ticket_no": 1,
                 # NAV-011 canonical formula.
                 #
                 # NAV-009 stores refunds as NEGATIVE entries in the
@@ -262,6 +302,7 @@ async def _attribute_revenue(db, clinic_id: str, partner_id: str,
             if net > 0:
                 net_by_invoice[row["invoice_id"]] = net
                 invoice_rev += net
+                invoices_for_classification.append(row)
 
     # HA-sale contribution: only if the linked invoice actually collected money.
     ha_rev = 0.0
@@ -288,11 +329,85 @@ async def _attribute_revenue(db, clinic_id: str, partner_id: str,
             if gate and gate > 0:
                 ha_rev += float(row.get("total") or 0)
 
+    # ── NAV-011 · Phase 2C · Category-aware classification pass ──
+    # We split ``invoice_rev`` (already the canonical net-collected sum)
+    # into ``diagnostics_revenue`` and ``ha_sales_revenue`` buckets
+    # using the same rules the internal-doctor dashboard applies. This
+    # is a pure in-memory pass on the invoice docs we already fetched
+    # above — NO additional DB round-trips beyond the appointment
+    # batch lookup.
+    diagnostics_rev = 0.0
+    ha_sales_rev = 0.0
+    if invoices_for_classification:
+        appt_ids = list({
+            inv.get("appointment_id")
+            for inv in invoices_for_classification
+            if inv.get("appointment_id")
+        })
+        wing_by_appt: dict[str, str] = {}
+        if appt_ids:
+            async for a in db.appointments.find(
+                {"clinic_id": clinic_id, "appointment_id": {"$in": appt_ids}},
+                {"_id": 0, "appointment_id": 1, "wing": 1},
+            ):
+                wing_by_appt[a["appointment_id"]] = a.get("wing") or "diagnostic"
+
+        for inv in invoices_for_classification:
+            net_collected = float(inv.get("net_collected") or 0.0)
+            if net_collected <= 0.005:
+                continue
+            is_ha_wing = (
+                wing_by_appt.get(inv.get("appointment_id") or "") == "hearing_aid"
+            )
+            diag_amt = 0.0
+            ha_amt = 0.0
+            for ln in (inv.get("lines") or []):
+                if not isinstance(ln, dict):
+                    continue
+                amt = float(ln.get("line_total") or 0.0)
+                if is_ha_wing or ln.get("product_type") == "Hearing Aid":
+                    ha_amt += amt
+                else:
+                    diag_amt += amt
+            # Legacy fallback: invoice has no line breakdown (very old
+            # or imported data). Bucket the whole invoice by parent
+            # linkage (matches referrals.py:274-281).
+            if not (diag_amt or ha_amt):
+                gt = float(
+                    inv.get("grand_total") or inv.get("rounded_total") or 0.0
+                )
+                if is_ha_wing or inv.get("ticket_no"):
+                    ha_amt += gt
+                else:
+                    diag_amt += gt
+            # Scale each bucket so the invoice's total contribution
+            # equals canonical net_collected (matches referrals.py:283-289).
+            gross = float(
+                inv.get("grand_total") or inv.get("rounded_total") or 0.0
+            )
+            if gross > 0.005:
+                scale = min(1.0, net_collected / gross)
+                diag_amt *= scale
+                ha_amt *= scale
+            diagnostics_rev += diag_amt
+            ha_sales_rev += ha_amt
+
     return {
+        # ── Pre-existing fields — preserved for backward compat ──
         "patients": len(pids),
         "invoice_revenue": round(invoice_rev, 2),
         "ha_sale_revenue": round(ha_rev, 2),
         "total_revenue": round(invoice_rev + ha_rev, 2),
+        # ── NAV-011 · Phase 2C · Category-aware attribution ──
+        # These three fields split the canonical `invoice_revenue`
+        # (net-collected) into two mutually-exclusive buckets.
+        # ``total_attributed_revenue`` therefore equals ``invoice_revenue``
+        # to within rounding — it is NOT the same as ``total_revenue``,
+        # which continues to include the separate ha_sales-collection
+        # add-on that pre-dates Phase 2C.
+        "diagnostics_revenue": round(diagnostics_rev, 2),
+        "ha_sales_revenue": round(ha_sales_rev, 2),
+        "total_attributed_revenue": round(diagnostics_rev + ha_sales_rev, 2),
     }
 
 
@@ -485,7 +600,16 @@ async def partner_dashboard(
         return {
             "partner": deserialize_datetime(p),
             "status_message": "Your account is pending approval by the clinic.",
-            "stats": {"patients": 0, "invoice_revenue": 0, "ha_sale_revenue": 0, "total_revenue": 0},
+            "stats": {
+                # Legacy fields (backward compat).
+                "patients": 0, "invoice_revenue": 0,
+                "ha_sale_revenue": 0, "total_revenue": 0,
+                # NAV-011 · Phase 2C · category-aware attribution fields
+                # exposed with zero values so the response shape is
+                # uniform between pending and active partners.
+                "diagnostics_revenue": 0, "ha_sales_revenue": 0,
+                "total_attributed_revenue": 0,
+            },
             "recent_patients": [],
             "payouts": [],
         }
