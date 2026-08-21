@@ -379,6 +379,10 @@ async def add_serials_to_product(
     # Audit trail — one event per insert.
     events = [{
         "serial_id": d["serial_id"],
+        # NAV-010 · INV-009 (Sprint-1 amendment) · Forward-only tenant
+        # stamping on the Catalogue Quick-Add writer. Historical
+        # serial_events are NOT backfilled.
+        "clinic_id": user["clinic_id"],
         "from": None, "to": "IN_STOCK",
         "at": now_iso, "actor_user_id": user["user_id"],
         "ref_doc": {"kind": "catalogue-quick-add", "id": product_id},

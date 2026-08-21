@@ -334,6 +334,102 @@ def test_inv009_return_borrow_stamps_clinic_id():
     assert evt.get("to") == "RETURNED"
 
 
+def test_inv009_add_serials_via_catalogue_stamps_clinic_id():
+    """Sprint-1 amendment · Catalogue Quick-Add serials writer.
+
+    POST /api/ha/products/{product_id}/serials emits one
+    ``catalogue-quick-add`` event per unit inserted. The Sprint-1
+    amendment stamps ``clinic_id`` on those NEW events. Proves:
+
+    1. The endpoint call creates a serial_events row.
+    2. The new event carries ``clinic_id`` = the authenticated user's clinic.
+    3. All legacy event fields remain unchanged.
+    4. Historical serial_events rows are NOT modified.
+    """
+    tok = login(ADMIN_EMAIL, ADMIN_PASSWORD)
+
+    # Snapshot of pre-existing rows for the test tenant. Historical
+    # events must NOT be touched (forward-only guarantee).
+    pre_snapshot = _run_mongo(lambda db: db.serial_events.find(
+        {"clinic_id": _CLINIC_ID},
+        {"_id": 0, "serial_id": 1, "at": 1, "to": 1, "clinic_id": 1},
+    ).to_list(5000))
+    pre_pairs = sorted((r["serial_id"], r["at"]) for r in pre_snapshot)
+
+    # Seed a serialised catalogue product for the test clinic. Direct
+    # insert bypasses the create endpoint (out-of-scope for this test);
+    # the fixture is fully self-contained and torn down implicitly by
+    # the tenant scope.
+    product_id = f"PRD-P2B-CAT-{uuid.uuid4().hex[:8].upper()}"
+    now_iso = time.strftime("%Y-%m-%dT%H:%M:%S+00:00")
+    _run_mongo(lambda db: db.ha_products.insert_one({
+        "product_id": product_id,
+        "clinic_id": _CLINIC_ID,
+        "brand": "P2B-CAT",
+        "model": f"Amendment-{uuid.uuid4().hex[:6]}",
+        "category": "hearing_aid",
+        "is_serialised": True,
+        "active": True,
+        "created_at": now_iso,
+        "updated_at": now_iso,
+    }))
+
+    serial_no = f"P2B-CAT-SN-{uuid.uuid4().hex[:8].upper()}"
+    r = requests.post(
+        f"{API}/ha/products/{product_id}/serials",
+        headers=H(tok),
+        json=[{
+            "serial_no": serial_no,
+            "branch_id": _BRANCH_ID,
+            "pool": "saleable",
+            "source_kind": "vendor",
+        }],
+        timeout=15,
+    )
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["inserted"] == 1
+    new_serial_id = body["serials"][0]["serial_id"]
+
+    # New event must exist and be stamped.
+    evt = _run_mongo(lambda db: db.serial_events.find_one(
+        {"serial_id": new_serial_id}, {"_id": 0},
+    ))
+    assert evt is not None, "Catalogue Quick-Add did not emit a serial_events row"
+
+    # (2) clinic_id stamped forward.
+    assert evt.get("clinic_id") == _CLINIC_ID, (
+        f"INV-009 amendment failed: clinic_id={evt.get('clinic_id')!r}"
+    )
+    # (3) Legacy fields unchanged.
+    assert evt.get("from") is None
+    assert evt.get("to") == "IN_STOCK"
+    assert evt.get("at")
+    assert evt.get("actor_user_id")
+    ref = evt.get("ref_doc") or {}
+    assert ref.get("kind") == "catalogue-quick-add"
+    assert ref.get("id") == product_id
+    assert "Added via Catalogue form" in (evt.get("note") or "")
+
+    # (4) No historical rows were modified. Compare the invariant
+    # (serial_id, at) tuple set for the test tenant BEFORE the call
+    # against the same set AFTER, excluding rows produced by this
+    # call. Every historical pair must still be present unchanged.
+    post_snapshot = _run_mongo(lambda db: db.serial_events.find(
+        {"clinic_id": _CLINIC_ID},
+        {"_id": 0, "serial_id": 1, "at": 1},
+    ).to_list(5000))
+    post_pairs_excluding_new = sorted(
+        (r["serial_id"], r["at"]) for r in post_snapshot
+        if r["serial_id"] != new_serial_id
+    )
+    assert post_pairs_excluding_new == pre_pairs, (
+        "Historical serial_events were modified — INV-009 forward-only "
+        "contract violated"
+    )
+
+
+
 def test_inv009_event_shape_preserves_all_legacy_fields():
     """Concretely enforce: emitting NEW events must not drop or rename
     any legacy field. INV-009 is additive only."""
