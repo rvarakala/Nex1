@@ -279,33 +279,6 @@ async def _compute_dashboard(db) -> dict:
     activation_rate = round(100 * activated_30 / max(signups_30, 1), 1)
     verified_to_activated = round(100 * activated_30 / max(verified_30, 1), 1)
 
-    # ---- Advance Receipts summary (platform-wide, active only) --------
-    # Sum of `received_amount` for status=active advance receipts across
-    # every tenant. Also counts distinct clinics with any active advance
-    # and total active receipt rows for the "N clinics · M receipts"
-    # sub-line. Very cheap: single aggregation, uses the
-    # (clinic_id, status, created_at) index installed for the AR module.
-    advance_bal = 0.0
-    advance_rows = 0
-    advance_clinics = 0
-    try:
-        async for row in db.advance_receipts.aggregate([
-            {"$match": {"status": "active"}},
-            {"$group": {
-                "_id": None,
-                "total": {"$sum": "$received_amount"},
-                "rows":  {"$sum": 1},
-                "clinics": {"$addToSet": "$clinic_id"},
-            }},
-        ]):
-            advance_bal = round(float(row.get("total") or 0), 2)
-            advance_rows = int(row.get("rows") or 0)
-            advance_clinics = len(row.get("clinics") or [])
-    except Exception:
-        # Collection may not exist yet on very fresh tenants — fall back
-        # to zeros so the tile still renders.
-        pass
-
     return {
         "kpis": {
             "active_clinics": active,
@@ -318,9 +291,6 @@ async def _compute_dashboard(db) -> dict:
             "churn_rate_pct": churn_rate,
             "payment_failures": payment_failures,
             "avg_revenue_per_tenant": avg_per_tenant,
-            "advance_balance_active": advance_bal,
-            "advance_active_rows":    advance_rows,
-            "advance_active_clinics": advance_clinics,
         },
         "plan_distribution": [{"tier": t, "count": plan_dist.get(t, 0)} for t in TIER_ORDER],
         "revenue_by_tier": [{"tier": t, "revenue": round(tier_revenue.get(t, 0), 2)} for t in TIER_ORDER],

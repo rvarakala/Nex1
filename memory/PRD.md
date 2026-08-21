@@ -41,15 +41,13 @@
   - `AdvanceReceiptModal` — shared component; regenerates idempotency key on every mount; prominent "NOT a Tax Invoice" warning; success screen with one-click print-to-PDF via new tab.
   - Every interactive element has a unique `data-testid` (`advance-receipt-*`, `advance-receipts-*`, `profile-advances-*`).
 
-- **Founder Dashboard cross-tenant tile:**
-  - New "Platform Active Advance Balance" card between the KPI row and the Signup Funnel on `/admin` (`DashboardPage.jsx`), showing platform-wide sum of `received_amount` for `status=active` advances + sub-line `N clinics · M receipts`.
-  - Backend: `_compute_dashboard()` in `backend/routers/admin_panel.py` extended with a single aggregation on `db.advance_receipts` (uses the `(clinic_id, status, created_at)` index). New KPI fields `advance_balance_active / advance_active_rows / advance_active_clinics`. Existing 30-second dashboard cache still applies.
+- **Founder Dashboard cross-tenant tile:** **⛔ REVERTED on 2026-08-21 (Preview only — not yet in Production).** Was briefly implemented as a "Platform Active Advance Balance" card on `/admin`. User pointed out that tenant-level financial data (individual clinic revenues + advance balances) is **out of scope for the SaaS founder view** and violates the tenant-privacy boundary — advance receipts are a clinic's internal cashbook, not a SaaS product metric, and aggregating them into a founder tile creates DPDPA / audit exposure surface and sets a bad precedent. The tile was removed and the `_compute_dashboard()` aggregation was reverted. The tenant-scoped Advance Receipt Phase 2A code (both endpoints and UI) remains intact and Production-deployed. The reverted files (Preview-only edits, not in Production): `backend/routers/admin_panel.py` (aggregation removed), `frontend/src/modules/admin/panel/DashboardPage.jsx` (card removed). Founder Dashboard has been returned to platform-level SaaS metrics only.
 
 **Post-implementation preview fix:**
 - The Advance-Receipts patient picker initially called `/api/patients/search?q=…` which does not exist and returned nothing on typing. Switched to the canonical `GET /api/patients?search=…&limit=8` (same endpoint used by `CreateInvoicePage`). Verified via Preview UI screenshot — picker returns matches correctly.
 
 **Regression evidence**:
-- **Advance Receipts Phase 2A targeted suite: 28/28 PASS** in 12.72 s (`backend/tests/test_advance_receipts_phase2a.py`).
+- **Advance Receipts Phase 2A targeted suite: 27/27 PASS** in ~12 s (`backend/tests/test_advance_receipts_phase2a.py`). *(One additional test that had asserted the reverted Founder Dashboard aggregation was removed alongside the revert; the remaining 27 tests cover the entire tenant-scoped contract.)*
   - Idempotency-Key contract: missing key → 400; malformed key → 400; first hit no replay header; same key + same payload → replay; same key + different payload → 422.
   - Validation: amount ≤ 0 → 422; non-catalogue method → 422; unknown/cross-tenant patient → 404.
   - Numbering: `AR/YYYY/NNNNNN` monotonic; receipt_id + receipt_no unique across a burst.
@@ -82,7 +80,7 @@
   - `POST /api/advance-receipts` → 401
   - `POST /api/advance-receipts/{dummy}/void` → 401
 - **Idempotency-Key does NOT bypass auth on Production** — `POST /api/advance-receipts` with `Idempotency-Key: prod-verify-postdeploy-01` still returned **401**. Critical invariant preserved.
-- Founder Dashboard endpoint (Advance-tile source) → **401** on `GET /api/admin/v2/dashboard`.
+- Founder Dashboard endpoint (Advance-tile source) → **401** on `GET /api/admin/v2/dashboard`. *(NOTE: the "Advance-tile source" phrasing describes the endpoint at the moment of the verification pass. The tile was reverted immediately after, on 2026-08-21 — see the "Founder Dashboard cross-tenant tile" bullet above.)*
 - Sanity control `GET /api/definitely-nonexistent-advance-route` → **404**, confirming above 401s are genuine auth-gate hits, not path-not-found masquerades.
 - **Zero unexpected 4xx · Zero 5xx · Zero 502/503/504.**
 - **Zero authenticated Production requests · Zero Production writes.**
@@ -91,7 +89,7 @@
 
 - **Directly Production-verified**:
   - Application health, SPA availability.
-  - Route availability of all 5 Advance Receipt routes + founder dashboard route.
+  - Route availability of all 5 Advance Receipt routes.
   - Authentication boundary — including the invariant that `Idempotency-Key` does NOT bypass auth on `POST /api/advance-receipts`.
   - Full NAV-012 protected surface still 401-gated.
   - Absence of unexpected public / API errors.
@@ -105,7 +103,6 @@
   - RBAC allow/deny for create + void + read.
   - Printable receipt content (No GST/HSN/SAC, disclaimer wording, VOIDED watermark).
   - Non-interference invariants (no invoice / payment / serial mutation).
-  - Founder Dashboard aggregation numeric contract.
   - Production database contents (never queried).
   - Production commit SHA (no public `/api/health/build` endpoint deployed — a pre-existing NAV-011/12 observation).
 

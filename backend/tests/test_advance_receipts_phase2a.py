@@ -452,27 +452,3 @@ def test_advance_does_not_appear_in_billing_invoices_list(admin_token):
     ids = {i.get("invoice_id") or i.get("invoice_no") for i in inv_list}
     assert ar["receipt_id"] not in ids
     assert ar["receipt_no"] not in ids
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Founder Dashboard aggregate
-# ─────────────────────────────────────────────────────────────────────
-
-def test_founder_dashboard_exposes_advance_balance():
-    """The founder dashboard must surface `advance_balance_active`,
-    `advance_active_rows`, and `advance_active_clinics` under `kpis`.
-    Founder account is seeded on every start so this endpoint is
-    always available.
-    """
-    from _helpers import FOUNDER_EMAIL, FOUNDER_PASSWORD
-    tok = login(FOUNDER_EMAIL, FOUNDER_PASSWORD)
-    r = requests.get(f"{API}/admin/v2/dashboard", headers=H(tok), timeout=15)
-    assert r.status_code == 200, r.text
-    k = r.json().get("kpis", {})
-    assert "advance_balance_active" in k
-    assert "advance_active_rows" in k
-    assert "advance_active_clinics" in k
-    # Sanity: types are numbers (may be zero on a very fresh install).
-    assert isinstance(k["advance_balance_active"], (int, float))
-    assert isinstance(k["advance_active_rows"], int)
-    assert isinstance(k["advance_active_clinics"], int)
