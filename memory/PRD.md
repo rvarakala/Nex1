@@ -1,6 +1,112 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-011 — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview regression, Preview/code-level financial-data-plane clarification, manual Production deployment, and read-only Production post-deployment verification.
+
+**Title**: NAV-011 — Referral Payouts / Revenue Attribution · Phase 2A
+**Production status**: DEPLOYED AND POST-DEPLOYMENT VERIFIED
+**Final verification status**: 🟢 PASS — Production `/api/health` (200), SPA `/` (200), NAV-011 route registration/reachability, and the full NAV-005 → NAV-010 protected surface were directly verified via unauthenticated read-only probes on `https://audinexa.com`. Every NAV-011 Phase 2A route (`GET/POST /api/referral-partners`, `PATCH /api/referral-partners/{pid}`, `GET /api/referral-partners/{pid}/stats`, `POST /api/referral-partners/patients/{pat}/attach-code`, `GET /api/referral-partners/{pid}/payouts`, `POST /api/referral-partners/{pid}/payouts`, `POST /api/referral-partners/{pid}/payouts/{payout_id}/mark-paid`, `POST /api/referral-partners/{pid}/payouts/{payout_id}/void`, `POST /api/referral-partners/{pid}/payouts/{payout_id}/reverse`, `POST /api/referral-partners/recovery-ledger`, `GET /api/referral-partners/recovery-ledger`, `GET /api/referrals/dashboard`, `GET /api/referrals/pathways`) is live on Production and gated by authentication (401 on synthetic dummy IDs).
+
+**Preview vs Production verification boundary (do not upgrade)**:
+- **Directly observed on Production** (A): `/api/health` 200, SPA 200 with `<title>AUDINEXA — Audiology Clinic OS</title>` and hydrated hero, auth-layer sanity (`me`/`my-clinics`/`switch-clinic` → 401, `/api/definitely-nonexistent-route` → 404), every NAV-011 route registered and 401-gated, full NAV-005 → NAV-010 protected surface still 401-gated, zero 5xx, zero genuine unexpected 4xx, HSTS-preload + `nosniff` headers present, session cookies `HttpOnly · Secure · SameSite=Lax`.
+- **Preview / code-level verified** (B): Bundle 1 canonical revenue formula (`max(0, paid_total)` with `grand_total` legacy fallback when `paid_total is None ∧ status='paid'`) — confirmed against `backend/routers/referral_partners.py:246-256` and `backend/routers/referrals.py:248-255` and reconciled against 5 real Preview invoice classes (fully paid, partial, partially refunded, fully refunded, legacy). Bundle 2 exclusive precedence (Partner > Doctor). Bundle 3 overlap-guard behaviour (409 on overlap, 422 on invalid periods, void releases window). Bundle 4 lifecycle CAS on `status=pending` for mark-paid / void, and CAS on `status=paid` for reverse (owner-only). Bundle 5 recovery-ledger deduction inside `create_payout` via `_consume_pending_recovery` with no-negative-payout invariant and residual-carry semantics. All confirmed present in the deployed source and covered by the 42/42 targeted regression suite.
+- **Not independently verifiable from Production** (C): Production commit SHA (no public `/api/health/build`, `/api/version`, `/api/commit`, or `/api/health/version` endpoint deployed — all four returned 404), live Production DB counts of invoice classes / duplicate payout groups / index shapes (no Production DB access from the closure session), and any authenticated NAV-011 flow end-to-end on Production against real data (deliberately not tested per the no-authenticated-transactions rule).
+
+Under the established "Preview represents Production unless contrary evidence is discovered" project convention, no contrary evidence was discovered. **We do NOT claim authenticated Production financial transactions were directly tested** — the PASS verdict reflects the boundary between (A) directly-observed Production public/API surface and (B) Preview/code-level financial-data-plane behaviour, exactly as scoped in the closure authorization.
+
+**Approved Phase 2A scope · completed**:
+
+- **Bundle 1 — Canonical Commissionable Revenue**
+  - Unpaid invoice → ₹0.
+  - Partial payment → commission based on `paid_total`.
+  - Full payment → `paid_total`.
+  - Partial refund → `paid_total` remains the net-collected amount (NAV-009 stores refunds as negative payments, so `paid_total` is already net of refunds).
+  - Full refund → ₹0.
+  - `refunded_total` is **NOT** subtracted a second time (executed aggregation is `max(0, paid_total)`; the stale `paid_total − refunded_total` docstring at `referral_partners.py:200-204` / `referrals.py:200-205` is documentation drift only — cosmetic docstring correction is deferred as a Phase 2B micro-item).
+  - Legacy `paid_total=None` fallback retained as a documented limitation: if `status='paid'` then commissionable = `grand_total`, else 0. 2 of 672 Preview invoices fall in this class.
+
+- **Bundle 2 — Exclusive Referral Attribution**
+  - Exactly one canonical referral source per patient.
+  - External Referral Partner takes precedence over Internal Referring Doctor (Partner > Doctor).
+  - Historical attribution records were **NOT** rewritten.
+
+- **Bundle 3 — Duplicate / Overlap Protection**
+  - Overlapping active payout windows rejected with **409** (`referral_partners.py:738-756`).
+  - Exact duplicate payout windows rejected.
+  - Void payouts release the period (overlap filter is `status ∉ {void}`).
+  - Invalid periods rejected with **422** (missing / `period_start > period_end`).
+  - Application-level overlap protection implemented (`find_one` + `insert_one`; best-effort under strict-concurrent creation from separate processes, formally acknowledged by `test_bundle3_concurrent_creation_race_exactly_one_wins` which accepts `[200,200]`).
+  - **Database unique compound index remains DEFERRED** — see Phase 2D backlog.
+
+- **Bundle 4 — Payout Lifecycle**
+  - `pending → paid` via CAS on `status=pending` (`referral_partners.py:830-842`) records `paid_at`, `payment_ref`, `paid_by_user_id`, `paid_by_name`.
+  - `pending → void` via CAS on `status=pending` records `voided_at`, `voided_by_user_id`, `voided_by_name`, and requires `void_reason`.
+  - `paid → reversed` via CAS on `status=paid` (`referral_partners.py:965-978`) records `reversed_at`, `reversed_by_user_id`, `reversed_by_name`, `reverse_reason`, and links `recovery_ledger_id_on_reverse`.
+  - Void and reverse require a `reason`.
+  - Paid reversal restricted to `clinic_owner` role (Decision #14 · Phase 2A · owner-only).
+  - Payouts are **never physically deleted** — status flips only; the ledger keeps history.
+  - Actor information captured on every transition where implemented.
+  - Lifecycle transitions use atomic/CAS protection where applicable; the reverse path creates the recovery-ledger row FIRST and self-voids that recovery row if the payout CAS loses.
+
+- **Bundle 5 — Recovery Ledger**
+  - `partner_recovery_ledger` collection created; controlled recovery-creation endpoint `POST /api/referral-partners/recovery-ledger` implemented (`referral_partners.py:1006-1055`).
+  - Pending recovery obligations reduce the partner's next payout via `_consume_pending_recovery` invoked inside `create_payout`.
+  - Recovery cannot produce a negative payout (`net_commission = max(0, gross_commission − deducted)`).
+  - Remaining recovery balance stays `pending` (residual carries forward to a subsequent payout).
+  - Automatic NAV-009 / NAV-010 refund / cancellation hooks that would emit recovery-ledger rows without an owner action **remain deferred** (Phase 2B).
+
+**Regression evidence (do not rewrite or hide)**:
+- **NAV-011 targeted suite: 42/42 PASS** (`backend/tests/test_nav011_referral_hardening.py`).
+- Pre-deployment clarification full-suite run (NAV-005 → NAV-011 + referral-corner umbrella): **286 tests collected · 284 deterministic PASS · 2 deterministic FAIL · 1 transient network flake that passes on isolated re-run · 0 NAV-011-caused regressions**.
+  - The 2 deterministic failures live in `tests/test_referrals_dashboard_bugfix.py` and are **PRE-EXISTING demo-seed baseline drift** on the `owner@thesoundclinic.in` and `dltest@example.com` tenants — reproducible without any NAV-011 code loaded and referencing tenants Phase 2A never touched. They are NOT hidden, NOT rewritten, NOT reclassified.
+  - The 1 transient flake is `tests/test_nav011_referral_hardening.py::test_bundle2_partner_only_still_earns` — a `ConnectionResetError` at the TCP layer against the local uvicorn during a concurrent HTTP call; the same test **passes deterministically on isolated re-run** (1 passed in 1.56 s).
+- File-by-file reconciliation matches `pytest --collect-only`: NAV-005 (47) + NAV-006 P1/P1b/P2A/P2B/P2C/P2D/P2D-F008 (11+9+16+5+10+8+5=64) + NAV-007 (22) + NAV-008 (29) + NAV-009 (20) + NAV-010 (32) + NAV-011 (42) = **256**; referral-corner umbrella (11+3+3+5+5+3) = **30**; **256 + 30 = 286**. No test file was renamed, deleted, or edited to reach these counts.
+
+**Production post-deployment verification evidence**:
+- `GET /api/health` → **200** in 0.555 s (`{"status":"healthy","timestamp":"2026-08-21T04:41:20.214920+00:00"}`).
+- `GET /` → **200**, SPA hydrated with hero, nav, and mock invoice + audiogram cards (Neo screenshot captured 2026-08-21 04:42 UTC, 1440×800).
+- NAV-011 protected routes → **24 expected 401** responses across GET/POST list/create/patch/stats/attach-code/payouts/mark-paid/void/reverse/recovery-ledger/dashboard/pathways probes.
+- NAV-005 → NAV-010 protected surfaces → intact (all 401 as expected on `me`, `my-clinics`, `switch-clinic`, `diagnostics/queue`, `sessions`, `hearing-reports/save`, `billing/invoices`, `payments`, `refund`, `cancel`, `quick-sales/{id}/cancel`, `serial-items`, `saleable-stock`, `serial-items/{id}/transition`).
+- **0 unexpected 4xx · 0 5xx · 0 502/503/504 · 0 Production writes · 0 authenticated Production requests.**
+
+**Manual Production deployment**:
+- Manual Production deployment was performed by the user.
+- **Emergent did NOT perform the deployment.**
+- Post-deployment verification was strictly read-only.
+
+**Historical financial data safety (this closure + the entire NAV-011 verification cycle)**:
+- No historical payout was modified.
+- No historical payout was deleted.
+- No payout was merged.
+- No historical payout was voided.
+- No historical payout was reversed.
+- No historical payout amount was changed.
+- No historical payout period was changed.
+- No historical recovery record was created.
+- Existing duplicate payout groups on Preview remain untouched (last read: 10 duplicate groups / 11 excess rows on `partner_payouts`, unchanged in shape from the pre-deployment clarification).
+- **No historical payout cleanup occurred during NAV-011.** Historical duplicate reconciliation remains a **SEPARATE FUTURE RECONCILIATION TASK** (Phase 2D backlog below).
+- No invoice, payment, or refund row was modified on either environment.
+- The NAV-011 deployment itself contains **no automatic historical cleanup or reconciliation** — no boot-time script, no `on_event("startup")` hook, no migration touches `partner_payouts`, `partner_recovery_ledger`, or `numbering_counters`.
+
+**Database index status**:
+- The compound unique payout index (`{clinic_id, partner_id, period_start, period_end}` with `partialFilterExpression: {status: {$ne: "void"}}`) **remains DEFERRED** and was **NOT created** during closure.
+- `partner_payouts` indexes remain: `_id_`, `clinic_id_1_partner_id_1_created_at_-1`, `payout_id_1` — unchanged.
+- Existing duplicate payout groups must be reconciled and financially reviewed **BEFORE** any unique index is considered (Phase 2D).
+
+**NAV-008 status**: 🟢 CLOSED · not reopened by NAV-011. `tenant-sound-clinic-blr / INV/2026/000004` was not modified, deleted, renumbered, merged, or reconciled during NAV-011 preview build, regression, verification, or closure. **NAV-008 counter reconciliation remains DEFERRED and was NOT executed.** Historical invoice/counter work remains deferred to a future NAV-008 sprint per prior closure convention.
+
+**Deferred backlog — do not implement**:
+- **NAV-011 Phase 2B** — UX/RBAC hardening; automatic recovery-ledger emission from NAV-009 refund and NAV-010 cancellation atomic paths; docstring correction for `paid_total − refunded_total` drift; any additional referral UX improvements.
+- **NAV-011 Phase 2D** — Historical duplicate payout reconciliation; financial verification of the duplicate payout groups; controlled correction / void / reversal workflow for confirmed dupes; and, only AFTER reconciliation, evaluate and create the appropriate compound unique index on `partner_payouts`.
+- **NAV-008** — Counter reconciliation; historical invoice duplicate cleanup.
+- **Financial hardening** — Idempotency-Key hardening for payment/refund requests; other previously deferred financial-integrity work.
+- **NAV-012 and beyond** — Not started. Do NOT start automatically. Explicit future authorization from the user is required for each new sprint.
+
+**No further NAV-011 work planned. Phase 2B not started. Phase 2D not started. NAV-012 not started. Historical payout reconciliation, unique compound index creation, NAV-008 counter reconciliation, and NAV-009 refund → recovery-ledger auto-emission all NOT STARTED — each requires explicit future authorization from the user.**
+
+
 ## 🏁 NAV-010 — FORMALLY CLOSED (2026-08-19)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview regression, manual Production deployment, and read-only Production post-deployment verification.
