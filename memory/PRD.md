@@ -1,6 +1,79 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 NAV-010 · PHASE 2B · SPRINT 1 — INVENTORY HARDENING — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview implementation, targeted Preview regression (28/28 new Sprint-1 tests + 32/32 NAV-010 Phase 2A regression tests), user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification at 🟡 PASS WITH OBSERVATION (observation is the pre-existing NAV-012 Bundle D Option-C build-identity deferral, NOT a Sprint-1 regression).
+
+**Title**: NAV-010 · Phase 2B · Sprint 1 — Inventory Hardening covering **INV-009 · INV-010 · INV-011 · INV-012 · INV-013 · INV-014 · INV-018**, plus an authorized Option-A amendment closing INV-009's Catalogue Quick-Add writer gap.
+
+**Scope Delivered (approved sprint boundary)**:
+
+| ID | Requirement | Delivery |
+|---|---|---|
+| **INV-009** | Forward-only `clinic_id` stamping on every NEW `serial_events` writer | ✅ **COMPLETE** — all **6** direct writers stamped: `utils/ha_states.py::transition_serial` (via `si.get("clinic_id")`), `routers/ha_inventory.py::{mark_serial_demo, unmark_serial_demo, return_borrowed_unit}` (via `user["clinic_id"]`), `routers/ha_procurement.py::create_grn` (via `user["clinic_id"]`), and **`routers/ha_products.py::add_serials_to_product`** via the authorized Sprint-1 Option-A amendment. All indirect writers (through `transition_serial`) are transitively covered. Historical rows NOT backfilled per the forward-only mandate. |
+| **INV-010** | Compound clinic-scoped index on `serial_events` | ✅ `serial_events_clinic_serial_at` = `(clinic_id, 1), (serial_id, 1), (at, -1)` (non-unique) — additive; legacy `(serial_id, at)` index preserved |
+| **INV-011** | Compound clinic-scoped index on `accessory_events` | ✅ `accessory_events_clinic_sku_at` = `(clinic_id, 1), (sku_id, 1), (at, -1)` (non-unique) — first index on the collection |
+| **INV-012** | Uniqueness + clinic-status + group indexes on `stock_requests` | ✅ `uniq_stock_request_id` (unique on `request_id`), `stock_requests_clinic_status_ct`, `stock_requests_group_status_ct` — first indexes on the collection |
+| **INV-013** | Uniqueness + audit-lookup indexes on `payment_reversals` | ✅ `uniq_payment_reversal_id` (unique on `reversal_id`), `payment_reversals_clinic_invoice`, `payment_reversals_clinic_quick_sale` — first indexes on the collection; payment/reversal logic NOT modified |
+| **INV-014** | Deduplicate `_branch_scope` helper into a single canonical implementation with zero behavioural change | ✅ New `backend/utils/branch_scope.py` (single canonical helper). Both `routers/ha_inventory.py` and `routers/ha_procurement.py` alias-import it. Byte-for-byte equivalent output on every input scenario (clinic-wide role, branch-scoped role, multi-branch, empty branch list, missing `branch_ids` key). `stock_transfers._accessible_clinic_ids` and `stock_requests._accessible_clinic_ids_for_requests` deliberately excluded (different semantics). |
+| **INV-018** | Performance index on `serial_items` | ✅ `serial_clinic_branch_product_state` = `(clinic_id, 1), (branch_id, 1), (product_id, 1), (state, 1)` (non-unique) — additive; every legacy index preserved |
+
+**Deliberately EXCLUDED / HELD in Sprint 1** (documented for continuity, NOT started):
+
+- **INV-015** — stock-transfer tenant-boundary audit row → HOLD
+- **INV-016** — unique index on `ha_products(clinic_id, brand, model, accessory_kind)` → HOLD (Preview duplicate survey completed READ-ONLY: 31 duplicate groups on `ha_products`, ALL fixture-prefixed on `clinic-pytest-suite` [23] and `tenant-sound-clinic-blr` [8]; **REAL-TENANT DUPLICATES = 0**; no data touched, no unique index created)
+- **INV-017** — `sync_inventory` migration from embedded `history: [...]` array to `serial_events` collection → HOLD
+
+**Idempotent Startup Contract**: every `create_index` call is wrapped in `try/except _log.warning(...)` so startup cannot crash on pre-existing-data / index conflicts (verified by `test_startup_index_creation_is_idempotent`).
+
+**Preview Test Evidence**:
+
+- **Sprint-1 targeted suite** (`backend/tests/test_nav010_phase2b_inventory_hardening.py`): **28 / 28 PASS** in 5.98 s — INV-009 writers × 6 (5 Sprint-1 + 1 amendment) + INV-010/011/012/013/018 index existence + additive-only guarantees + INV-014 zero-diff behavioural equivalence (7 tests) + startup idempotency + NAV-010 Phase 2A regression sanity (3 tests).
+- **NAV-010 Phase 2A regression** (`backend/tests/test_nav010_inventory_hardening.py`): **32 / 32 PASS** in 110.89 s — first-attempt deterministic pass with no ConnectTimeout flakes.
+
+**Production Post-Deployment Verification (2026-08-21, unauthenticated)**:
+
+| Check | Result |
+|---|---|
+| `GET https://audinexa.com/api/health` | `200 · {"status":"healthy"}` |
+| `GET https://audinexa.com/` | `200 · AUDINEXA HTML shell` |
+| NAV-010 protected POST routes without credentials | `401` on `serial-items/{id}/transition`, `.../mark-demo`, `.../return-borrow`, `quick-sales/{id}/cancel` |
+| NAV-010 protected GET routes without credentials | `401` on `products/{id}/serials`, `serial-items/{id}/timeline`, `stock-requests`, `accessory-stock`, `auth/me` |
+| Synthetic 404 control | `404 · {"detail":"Not Found"}` |
+| Unexpected 5xx count | **0** |
+| Production writes performed | **0** |
+| Production DB modifications | **0** |
+| Historical backfill | none |
+| Reconciliation / cleanup | none |
+
+**Known Observation** (accepted, NOT blocking): `GET /api/health/build` returns `{"commit":"unknown","built_at":"unknown","environment":"unknown"}` — the previously-accepted NAV-012 Bundle D Option-C deferral. Sprint-1 commit identity cannot be independently confirmed from Production via this endpoint; verdict remains 🟡 PASS WITH OBSERVATION because every other observable dimension passes cleanly.
+
+**Closed Architectures Untouched** (verified via `git diff --name-only`): NAV-009 (payment / refund), NAV-011 (referral), NAV-012 (Advance Receipt), Advance Allocation writer, Apply Advance UX, Bundle D `/api/health/build` handler, billing/payment atomic logic, historical financial data.
+
+**Deployment Surface** (7 files committed as Sprint-1 + amendment):
+
+- `backend/routers/ha_inventory.py` — INV-009 (3 writers) + INV-014 alias import
+- `backend/routers/ha_procurement.py` — INV-009 (GRN writer) + INV-014 alias import
+- `backend/routers/ha_products.py` — INV-009 amendment (Catalogue Quick-Add writer)
+- `backend/server.py` — INV-010/011/012/013/018 idempotent index bootstrap (each wrapped in try/except `_log.warning`)
+- `backend/utils/branch_scope.py` *(new)* — INV-014 canonical helper
+- `backend/utils/ha_states.py` — INV-009 (`transition_serial` stamping)
+- `backend/tests/test_nav010_phase2b_inventory_hardening.py` *(new)* — 28 targeted tests
+
+**Original Sprint-1 commit**: `6704e49` · **Option-A amendment** applied against working tree and folded into HEAD by Emergent auto-commit prior to manual Production deployment.
+
+**Explicit Non-Goals of Sprint 1** (NOT started, still explicitly HOLD after closure):
+- INV-015 (tenant-boundary audit on stock-transfer receive)
+- INV-016 (unique ha_products index creation — Preview survey done, no writes, no index)
+- INV-017 (`sync_inventory` history-array → `serial_events` migration)
+- NAV-011 Phase 2C (category-aware referral attribution)
+- NAV-013 (any) · Advance Phase 2B.4 · REC-AUTO-001 · any historical cleanup / backfill / reconciliation
+
+---
+
+
+
 ## 🏁 ADVANCE ALLOCATION · PHASE 2B.3 (UX CORRECTION) · APPLY ADVANCE INLINE — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview implementation, targeted Preview regression (17/17 new inline UX tests + 134/134 full Advance-stack tests + 52/52 adjacent NAV-009/010 tests), user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification.
