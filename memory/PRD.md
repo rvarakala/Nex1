@@ -1,6 +1,150 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 URGENT CLIENT REQUIREMENT · ADVANCE RECEIPT · PHASE 2A — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview implementation, Preview regression (28/28 targeted + NAV-005..NAV-012 clean-runs), user's manual Production deployment, and read-only Production post-deployment verification.
+
+**Title**: Urgent Client Requirement — Advance Receipt / Payment Acknowledgement · Phase 2A (Receipt-only)
+**Production status**: DEPLOYED AND POST-DEPLOYMENT VERIFIED
+**Final verification verdict**: **🟡 PASS WITH OBSERVATION** — application/public-surface behaviour directly verified on Production via strictly read-only unauthenticated probes; authenticated financial data-plane behaviour NOT directly exercised on Production (zero authenticated financial writes performed) and is supported by Preview 28/28 targeted regression, deployed-code identity, and the established "Preview represents Production unless contrary evidence" project convention. This is consistent with the NAV-012 closure posture.
+
+**Approved Phase 2A scope · completed**:
+
+- **New isolated collections** (zero coupling to `invoices` / `payments` / `serial_items` / `accessory_stock` / GST):
+  - `db.advance_receipts` — one row per acknowledged advance, with `receipt_id`, `receipt_no` (AR/YYYY/NNNNNN), `clinic_id`, `patient_id/name/mobile/mrd` snapshot, `received_amount`, `method`, `reference`, `purpose_note`, `status ∈ {active, voided}`, actor fields, `received_at`, `created_at`, and (when idempotency was enabled) `idempotency_correlation_id`.
+  - `db.advance_audit_events` — append-only lifecycle log (`kind ∈ {created, voided}`).
+
+- **New API endpoints (all tenant-scoped, all clinic_id-guarded):**
+  - `POST /api/advance-receipts` — **MANDATORY `Idempotency-Key` header** enforced (400 on missing/malformed). Scope `advance_receipt`. RBAC `front_desk / accounts / clinic_owner` (super_admin/founder bypass). Same-key replay returns cached body with `Idempotency-Replay: true`. Same-key different-payload → HTTP 422. Amount enforced `> 0`. Method restricted to `cash / upi / card / bank_transfer / cheque / insurance / other`. Cross-tenant / unknown patient → HTTP 404.
+  - `GET /api/advance-receipts` — list scoped to caller's clinic, supports `patient_id / status / date_from / date_to / limit` filters, returns `{items, count, active_total}`.
+  - `GET /api/advance-receipts/{id}` — read single (clinic-scoped).
+  - `POST /api/advance-receipts/{id}/void` — RBAC `accounts / clinic_owner` (super_admin/founder bypass). CAS on `status=active`; reason mandatory (≥3 chars); double-void → HTTP 409; missing id → HTTP 404. Void event audited.
+  - `GET /api/advance-receipts/{id}/receipt.pdf` — print-ready HTML A5 acknowledgement. Distinct branding, `AR/YYYY/NNNNNN`, explicit `NOT a Tax Invoice` disclaimer, no GST/HSN/SAC blocks, VOIDED watermark when applicable.
+
+- **Numbering:** `AR/YYYY/NNNNNN` via a dedicated clinic-scoped counter `advance_receipt:{clinic}:{year}` — zero collision with the invoice counter. Monotonic verified per-tenant per-year.
+
+- **Idempotency wiring:** `SUPPORTED_SCOPES` extended by one value `"advance_receipt"` in `backend/utils/idempotency.py`. All existing scopes (`payment`, `refund`, `payout`) unchanged. The shared 24h TTL, UNIQUE `(clinic_id, scope, key)` index, payload-mismatch protection, and crash-recovery logic apply verbatim.
+
+- **Startup indexes installed at `lifespan()` (idempotent, wrapped in try/except):**
+  - `advance_receipts.receipt_id` UNIQUE
+  - `advance_receipts.(clinic_id, receipt_no)` UNIQUE (compound `uniq_clinic_advance_receipt_no`)
+  - `advance_receipts.(clinic_id, patient_id, created_at desc)`
+  - `advance_receipts.(clinic_id, status, created_at desc)`
+  - `advance_audit_events.event_id` UNIQUE
+  - `advance_audit_events.(receipt_id, at desc)`
+  - `advance_audit_events.(clinic_id, at desc)`
+
+- **Frontend surface:**
+  - Billing → new `Advances` tab (route `/billing/advances`) with `AdvanceReceiptsPage` — summary tiles (Active Total / Total Rows / Active / Voided), search + status filter, ledger table, patient picker → `AdvanceReceiptModal`.
+  - Patient profile → new `Advances` sub-tab (icon `HandCoins`) with per-patient advance list, "Receive Advance" CTA, per-row Print / Void actions.
+  - `AdvanceReceiptModal` — shared component; regenerates idempotency key on every mount; prominent "NOT a Tax Invoice" warning; success screen with one-click print-to-PDF via new tab.
+  - Every interactive element has a unique `data-testid` (`advance-receipt-*`, `advance-receipts-*`, `profile-advances-*`).
+
+- **Founder Dashboard cross-tenant tile:**
+  - New "Platform Active Advance Balance" card between the KPI row and the Signup Funnel on `/admin` (`DashboardPage.jsx`), showing platform-wide sum of `received_amount` for `status=active` advances + sub-line `N clinics · M receipts`.
+  - Backend: `_compute_dashboard()` in `backend/routers/admin_panel.py` extended with a single aggregation on `db.advance_receipts` (uses the `(clinic_id, status, created_at)` index). New KPI fields `advance_balance_active / advance_active_rows / advance_active_clinics`. Existing 30-second dashboard cache still applies.
+
+**Post-implementation preview fix:**
+- The Advance-Receipts patient picker initially called `/api/patients/search?q=…` which does not exist and returned nothing on typing. Switched to the canonical `GET /api/patients?search=…&limit=8` (same endpoint used by `CreateInvoicePage`). Verified via Preview UI screenshot — picker returns matches correctly.
+
+**Regression evidence**:
+- **Advance Receipts Phase 2A targeted suite: 28/28 PASS** in 12.72 s (`backend/tests/test_advance_receipts_phase2a.py`).
+  - Idempotency-Key contract: missing key → 400; malformed key → 400; first hit no replay header; same key + same payload → replay; same key + different payload → 422.
+  - Validation: amount ≤ 0 → 422; non-catalogue method → 422; unknown/cross-tenant patient → 404.
+  - Numbering: `AR/YYYY/NNNNNN` monotonic; receipt_id + receipt_no unique across a burst.
+  - RBAC: front_desk can create; audiologist cannot create; audiologist cannot void; front_desk cannot void; accounts can void.
+  - Void state machine: void requires reason (≥3 chars, else 422); active → voided CAS; double-void → 409; missing id → 404.
+  - List: filters correctly by `patient_id` + `status`; totals reflect only active.
+  - Read: single-get 200; missing id 404.
+  - Printable: 200 text/html; contains receipt_no; contains "NOT a Tax Invoice" disclaimer; no GST/HSN/SAC; VOIDED watermark on voided receipts.
+  - **Non-interference invariants**: creating + voiding an advance did NOT increment `db.invoices`, `db.payments`, or `db.serial_items`; 2 audit events per receipt lifecycle written.
+  - Founder Dashboard: `/api/admin/v2/dashboard` returns numeric `advance_balance_active`, `advance_active_rows`, `advance_active_clinics` under `kpis`.
+- **Adjacent regression on isolated runs** (no interaction with this sprint's code paths, per convention):
+  - NAV-011 + NAV-012 combined: **73/73 PASS** in 156 s.
+  - NAV-009 + NAV-010 combined: **51/52 PASS** in 139 s — the single non-pass is the pre-existing `test_pay003_partial_then_final_payment_flow` network `ConnectTimeout` flake that passes deterministically on isolated re-run in 1.01 s (documented in the NAV-012 closure block). NOT caused by this sprint.
+- Lint (`ruff` + `eslint`) on every touched file: 0 findings.
+
+**Production deployment**:
+- Production deployment was performed **MANUALLY by the user** (deployed against `https://audinexa.com`).
+- **Emergent did NOT deploy.**
+- No Production deployment was performed by the agent at any point.
+- Deployment scope: 5 new backend files (`backend/models/_advance.py`, `backend/routers/advance_receipts.py`, `backend/tests/test_advance_receipts_phase2a.py`) and 5 new/modified frontend files (`AdvanceReceiptModal.jsx`, `AdvanceReceiptsPage.jsx`, `BillingModule.js`, `PatientProfilePage.jsx`, `DashboardPage.jsx`) plus 3 minor edits (`backend/server.py` +index setup + router registration, `backend/utils/idempotency.py` +1 scope, `backend/routers/admin_panel.py` +advance aggregation on dashboard).
+
+**Production post-deployment verification** (unauthenticated / read-only only, executed against `https://audinexa.com`):
+- `GET /api/health` → **200** `{"status":"healthy","timestamp":"2026-08-21T11:15:33.945044+00:00"}`, 0.156 s.
+- `GET /` → **200**, SPA hydrated with `<title>AUDINEXA — Audiology Clinic OS</title>`, 0.322 s.
+- NAV-012 protected surface still 401-gated: `GET /api/auth/me`, `GET /api/auth/my-clinics`, `GET /api/billing/invoices`, `GET /api/referral-partners` — all HTTP 401.
+- Advance Receipt Phase 2A new routes live and 401-gated:
+  - `GET /api/advance-receipts` → 401
+  - `GET /api/advance-receipts/{dummy}` → 401
+  - `GET /api/advance-receipts/{dummy}/receipt.pdf` → 401
+  - `POST /api/advance-receipts` → 401
+  - `POST /api/advance-receipts/{dummy}/void` → 401
+- **Idempotency-Key does NOT bypass auth on Production** — `POST /api/advance-receipts` with `Idempotency-Key: prod-verify-postdeploy-01` still returned **401**. Critical invariant preserved.
+- Founder Dashboard endpoint (Advance-tile source) → **401** on `GET /api/admin/v2/dashboard`.
+- Sanity control `GET /api/definitely-nonexistent-advance-route` → **404**, confirming above 401s are genuine auth-gate hits, not path-not-found masquerades.
+- **Zero unexpected 4xx · Zero 5xx · Zero 502/503/504.**
+- **Zero authenticated Production requests · Zero Production writes.**
+
+**Preview vs Production verification boundary (do NOT upgrade)**:
+
+- **Directly Production-verified**:
+  - Application health, SPA availability.
+  - Route availability of all 5 Advance Receipt routes + founder dashboard route.
+  - Authentication boundary — including the invariant that `Idempotency-Key` does NOT bypass auth on `POST /api/advance-receipts`.
+  - Full NAV-012 protected surface still 401-gated.
+  - Absence of unexpected public / API errors.
+
+- **Preview / regression verified only — NOT Production-tested**:
+  - Idempotency-Key first-hit / replay behaviour.
+  - Payload-mismatch **HTTP 422** on same-key + different payload.
+  - Amount / method validation, cross-tenant patient rejection.
+  - Void state machine (CAS, 409 on double-void, 404 on missing id).
+  - Numbering monotonicity per (clinic, year).
+  - RBAC allow/deny for create + void + read.
+  - Printable receipt content (No GST/HSN/SAC, disclaimer wording, VOIDED watermark).
+  - Non-interference invariants (no invoice / payment / serial mutation).
+  - Founder Dashboard aggregation numeric contract.
+  - Production database contents (never queried).
+  - Production commit SHA (no public `/api/health/build` endpoint deployed — a pre-existing NAV-011/12 observation).
+
+  **These behaviours were not represented as Production-tested and are not being retrospectively certified as such by this closure.**
+
+- **Project convention preserved**: *"Preview represents Production unless contrary evidence is discovered."* Through the legitimately available read-only Production verification, **no contrary evidence was discovered**. The 🟡 verdict deliberately captures this convention without inflating it.
+
+**Historical financial data safety (this closure + the entire Advance Receipt Phase 2A cycle)**:
+- **`tenant-sound-clinic-blr / INV/2026/000004`** remains untouched. Not queried, opened, referenced, renumbered, deleted, voided, merged, backfilled, or reconciled during this sprint.
+- **10 duplicate `(clinic_id, partner_id, period)` payout groups on Preview** remain untouched. Not queried, modified, voided, deleted, merged, or backfilled.
+- **55 dangling top-level `payments` rows on Preview** remain untouched.
+- **All historical `partner_recovery_ledger` rows** (58 on Preview) remain untouched.
+- **All historical invoices, payments, refunds, payouts** untouched.
+- **No historical financial-data cleanup occurred during Advance Receipt Phase 2A.**
+- **No compound unique index installed on `invoices`** — soft-failing NAV-008 boot pattern preserved unchanged.
+- **No compound unique index installed on `partner_payouts`** — remains DEFERRED to Phase 2D.
+
+**Phase-boundary compliance — nothing implemented outside authorized scope**:
+| Constraint | Status |
+|---|---|
+| No allocation-to-invoice UI or endpoint | ✅ Not implemented (Phase 2B) |
+| No refund-of-advance UI or endpoint | ✅ Not implemented (Phase 2C) |
+| No merge with existing invoices/payments | ✅ Not implemented (Phase 2D) |
+| No GST / HSN / SAC on receipt template | ✅ Explicitly excluded in the HTML template |
+| No inventory / serial / stock mutation | ✅ Verified by non-interference test |
+| No changes to existing idempotency scopes' behaviour | ✅ Only added `"advance_receipt"` to tuple |
+| No historical data touched | ✅ Zero migration, zero reconcile, zero backfill |
+
+**Deferred backlog — do NOT implement**:
+- **Advance Receipt Phase 2B** — allocation of an existing active Advance Receipt to a future Invoice with per-invoice partial-consumption tracking.
+- **Advance Receipt Phase 2C** — controlled refund of an unallocated Advance back to the payer.
+- **Advance Receipt Phase 2D** — merge compatibility (patient merges, cross-branch moves).
+- **NAV-011 Phase 2B, NAV-011 Phase 2D, NAV-012 Phase 2B/2D** — all pre-existing deferred items remain unchanged, do NOT implement without explicit authorization.
+- **NAV-013 and beyond** — NOT started.
+
+**No further Advance Receipt work planned. Phase 2B not started. Phase 2C not started. Phase 2D not started. NAV-013 not started. Historical duplicate reconciliation, orphan-payment reconciliation, unique compound index creations, NAV-008 counter reconciliation — all NOT STARTED — each requires explicit future authorization from the user.**
+
+
+
 ## 🏁 NAV-012 — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview implementation, exhaustive Preview regression (287/287 on isolated runs), user's manual Production deployment, and read-only Production post-deployment verification.

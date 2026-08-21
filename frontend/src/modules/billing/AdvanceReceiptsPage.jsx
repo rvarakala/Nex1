@@ -72,8 +72,9 @@ export default function AdvanceReceiptsPage() {
     if (!patientQuery || patientQuery.length < 2) { setPatientResults([]); return; }
     const t = setTimeout(async () => {
       try {
-        const r = await axios.get(`${API}/patients/search`, { params: { q: patientQuery, limit: 8 } });
-        setPatientResults(Array.isArray(r.data) ? r.data : (r.data?.items || []));
+        const r = await axios.get(`${API}/patients`, { params: { search: patientQuery, limit: 8 } });
+        const rows = Array.isArray(r.data) ? r.data : (r.data?.items || []);
+        setPatientResults(rows);
       } catch { setPatientResults([]); }
     }, 250);
     return () => clearTimeout(t);

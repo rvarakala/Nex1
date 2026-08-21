@@ -75,6 +75,28 @@ export default function DashboardPage() {
         <KPITile label="Avg ₹ / Tenant" value={fmtINR(kpis.avg_revenue_per_tenant)} tone="slate" testid="kpi-arpt" />
       </div>
 
+      {/* Platform Advances — active Advance-Receipt balance across every tenant */}
+      <div
+        className="rounded-2xl p-5 bg-gradient-to-br from-sky-50 via-cyan-50 to-emerald-50 border border-sky-200 flex items-center justify-between gap-4"
+        data-testid="founder-advances-card"
+      >
+        <div className="min-w-0">
+          <div className="text-[10.5px] font-semibold uppercase tracking-wider text-sky-700">Platform Active Advance Balance</div>
+          <div className="text-2xl xl:text-3xl font-bold mt-1 text-slate-900 truncate" data-testid="founder-advances-balance">
+            {fmtINR(kpis.advance_balance_active || 0)}
+          </div>
+          <div className="text-[11px] text-slate-500 mt-1" data-testid="founder-advances-subline">
+            {fmtInt(kpis.advance_active_clinics || 0)} clinics · {fmtInt(kpis.advance_active_rows || 0)} active receipts
+          </div>
+        </div>
+        <div className="hidden sm:block text-right shrink-0">
+          <div className="text-[10px] uppercase tracking-wider text-slate-500 font-semibold">Money-in-hand</div>
+          <div className="text-[11px] text-slate-500 mt-1 max-w-[220px] leading-snug">
+            Sum of ₹ received via Advance Receipts, before any final invoice, across every tenant.
+          </div>
+        </div>
+      </div>
+
       <SignupFunnel data={signup_funnel_30d} />
 
       <LatencySpeedometer />
