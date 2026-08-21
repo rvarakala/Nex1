@@ -1,6 +1,152 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 ADVANCE ALLOCATION · PHASE 2B.2 — FORMALLY CLOSED (2026-08-21)
+
+**Status**: 🟢 CLOSED · signed off by user after Phase 2B.1 safety corrections, Phase 2B.2 core-writer Preview implementation, targeted Preview regression (68/68 across Phase 2B.1 + Phase 2B.2 suites), one full-suite regression pass classified for infrastructure vs code root cause, user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification.
+
+**Title**: Advance Allocation · Phase 2B.2 — Core Advance-to-Invoice Allocation Writer (server-side only)
+
+**Final verification verdict**: **🟡 PASS WITH OBSERVATION** — preserved verbatim per user instruction. NOT upgraded to unconditional 🟢 PASS. Every directly observable Production public-surface requirement passes (health 200, SPA served, auth-gate 401 on every protected route including the new `POST /api/advance-receipts/{id}/allocations`, sanity 404 confirms the 401s are auth gates, zero 5xx observed, zero Production writes). Two dimensions remain independently unverifiable from the Preview environment: (a) Production MongoDB state has no approved read-only observation mechanism from this container; (b) Production build/commit identity is not exposed via any public probe (`/api/version`, `/api/commit`, `/api/health/build`, `/api/health/version`, `/api/build` all return 404 — same posture as NAV-012 and Phase 2A closures). These are verification limitations only and MUST NOT be represented as implementation failures.
+
+**Approved Phase 2B.2 scope · completed**:
+
+1. Phase 2B.1 safety correction — **completed**. Manual refund endpoint router-guard rejects `method="advance"` with HTTP 400 (fail-fast, no Idempotency-Key consumed on rejection).
+2. Phase 2B.2 core allocation writer — **implemented** as a single new endpoint `POST /api/advance-receipts/{receipt_id}/allocations` with mandatory `Idempotency-Key` header. No UI, no reversal, no refund — those are strictly out of scope.
+3. Approved financial architecture — **implemented**:
+   ```
+   Advance Receipt
+        ↓
+   Advance Allocation Ledger  (db.advance_allocations)
+        ↓
+   record_payment_atomic()
+        ↓
+   db.payments  (method="advance", advance_receipt_id, allocation_id)
+   ```
+4. Atomic advance-balance protection — CAS with `$gte:amt−MONEY_TOL` guard, `$inc: −amt / +amt` on `(available_balance, allocated_total)`. Loser receives HTTP 409 with fresh-balance diagnostic.
+5. Invoice / payment atomicity — inherited from NAV-009 `record_payment_atomic()` (aggregation-pipeline `find_one_and_update` with `$expr` overpayment + refund guard). Zero changes to existing invoice CAS behaviour.
+6. Idempotency — implemented via existing `IdempotencyContext`, scope `advance_allocation` registered in `SUPPORTED_SCOPES`. Correlation-id stamped on BOTH `advance_allocations` row AND embedded `db.payments` row for dual-anchor crash-recovery. `_rebuild_response` extended to handle the new scope.
+7. Tenant / clinic isolation — every DB query includes `clinic_id: user["clinic_id"]`. Cross-tenant probes return 404 at the tenant guard.
+8. RBAC — `ALLOCATE_ROLES = ("front_desk", "accounts", "clinic_owner")` mirrors the invoice payment RBAC; `super_admin` / `founder` bypass via existing `require_roles`. `audiologist` denied (403).
+9. Allocation / payment 1:1 consistency — every successful allocation produces exactly one `db.payments` row with `method="advance"`, matching `allocation_id`, `advance_receipt_id`, and shared `idempotency_correlation_id`. Post-run Preview verification: 46 active allocations ↔ 46 method=advance payment rows.
+10. Over-allocation protection — fast pre-check + authoritative CAS `$gte` guard block requests exceeding `available_balance`.
+11. Invoice outstanding protection — fast pre-check + inherited NAV-009 overpayment CAS block requests exceeding `due_total`.
+12. Concurrent allocation protection — CAS arbitration verified via `test_concurrent_allocations_never_over_consume` (ThreadPoolExecutor race: exactly one 200 + one 4xx, ledger stays consistent).
+13. Payment-failure compensating rollback — implemented and **deterministically tested** via `test_deterministic_rollback_on_payment_failure` (monkeypatch of `routers.advance_receipts.record_payment_atomic` inside the test process only; production behaviour unchanged). On failure: allocation `status: active → voided` with `void_reason="Payment write failed: <detail>"`, advance balance restored via `$inc`, idempotency record marked `failed`, no orphan payment persisted, no invoice mutation.
+14. Advance Receipt VOID safety guard — CAS tightened with `$expr: $lte [$ifNull("$allocated_total", 0), MONEY_TOL]`. Legacy Phase 2A rows (field absent, 127 documents) and the one Phase 2B.1-transition row (field present but null) remain voidable via `$ifNull` mapping null → 0. New rows with any `allocated_total > MONEY_TOL` return HTTP 409 with helpful detail.
+15. Manual refund cannot use `method="advance"` — Phase 2B.1 router-level guard preserves the reservation of `"advance"` for the Advance Allocation workflow only.
+
+**Data model additions**:
+
+- `db.advance_receipts` (additive, applied on NEW rows only — legacy 127 documents untouched):
+  - `available_balance: Optional[float]` — initialised to `received_amount` at CREATE.
+  - `allocated_total: Optional[float]` — initialised to `0.0` at CREATE.
+- `db.advance_allocations` (NEW collection):
+  - Fields: `allocation_id ("AA-<uuid12>")`, `allocation_no ("AA/YYYY/NNNNNN")`, `clinic_id`, `branch_id`, `advance_receipt_id`, `advance_receipt_no`, `invoice_id`, `invoice_no`, `patient_id`, `amount`, `status ∈ {active, voided}`, `correlation_id`, `idempotency_correlation_id`, `payment_id`, `note`, `created_at`, `created_by_user_id`, `created_by_name`, plus void metadata.
+  - Indexes created at startup (idempotent):
+    - `UNIQUE (clinic_id, allocation_id)` — `uniq_clinic_allocation_id`
+    - `UNIQUE (clinic_id, allocation_no)` — `uniq_clinic_allocation_no`
+    - `(clinic_id, advance_receipt_id, status)` — `aa_clinic_receipt_status`
+    - `(clinic_id, invoice_id)` — `aa_clinic_invoice`
+- `db.payments` (additive, nullable, populated only on allocation-sourced rows):
+  - `advance_receipt_id: Optional[str]`
+  - `allocation_id: Optional[str]`
+- `db.advance_audit_events.kind` — extended with `"allocated"`.
+- `models._canonical.PAYMENT_METHODS` — `"advance"` added. `Payment.method` and `RefundCreate.method` Literals widened; `PaymentCreate.method` deliberately NOT widened (front-desk manual payment cannot smuggle `"advance"`).
+- `utils.idempotency.SUPPORTED_SCOPES` — `"advance_allocation"` added; `_rebuild_response` extended for the new scope.
+
+**Testing evidence · Preview**:
+
+- **Phase 2B.1 + Phase 2B.2 targeted suite: 68/68 PASS** across four new test files:
+  - `test_advance_allocation_phase2b1_models.py` — 27 Pydantic-only schema tests.
+  - `test_advance_allocation_phase2b1_refund_guard.py` — 9 refund-guard tests.
+  - `test_advance_allocation_phase2b2.py` — 27 HTTP integration tests covering the user's 18-topic matrix (happy paths, partial/full allocation, over-allocation, cancelled/refunded invoice, voided advance, cross-patient/cross-tenant, RBAC, idempotency replay/mismatch, concurrent allocation, consistency, multiple allocations, multiple advances → one invoice, rollback on pre-check).
+  - `test_advance_allocation_phase2b2_safety.py` — 5 pre-deploy safety tests: unused-void, partial-alloc-void 409, full-alloc-void 409, zero-mutation on rejected void, and the **deterministic payment-failure rollback** test.
+- **Full regression suite (1790 tests) run once**: 853 passed, 121 failed, 240 errors, 576 skipped in 11m 42s. All 361 failure/error rows classified by signature:
+  - 249 rows attributable to auth **rate limit** 429 (`60 logins/minute` cap) exhausted by the bulk-run pace — infrastructure / test-harness issue, not code.
+  - 27 rows attributable to missing seed users (`founder@audinexa.com`, `admin@delhi.test`, `owner@thesoundclinic.in`) — pre-existing baseline seed gap.
+  - ~85 rows attributable to pre-existing baseline data drift (duplicate phones, stale sessions, orphan serials, pre-existing NAV-011 dltest payout gap, pre-existing `/appointments 500`).
+  - 6 rows attributable to environmental `ConnectTimeout` transients.
+  - **0 rows attributable to Phase 2B.2 code.** Verified by grepping `advance_alloc|advance_receipt` in FAILED/ERROR — empty result.
+- **Three heaviest failure suites re-run in isolation** (falsification of the rate-limit hypothesis):
+  - `test_nav012_payment_hardening.py` — bulk: 11 FAILED → isolated: **11/11 PASS in 9.0 s**.
+  - `test_nav010_inventory_hardening.py` — bulk: 22 FAILED → isolated: **32/32 PASS in 25.8 s**.
+  - `test_nav007_multi_branch_hardening.py` — bulk: 11 FAILED → isolated: **22/22 PASS in 18.9 s**.
+- **Zero NAV-005 → NAV-012 regressions attributable to Phase 2B.2.**
+
+**Deployment**:
+
+- **Production deployment was performed MANUALLY by the user.** Emergent did NOT perform the Production deployment; the platform's role was Preview implementation, Preview verification, pre-deploy review, and post-deploy read-only verification only.
+
+**Post-deployment verification** (strictly read-only, unauthenticated):
+
+- `GET https://audinexa.com/api/health` → **HTTP 200** with `{"status":"healthy","timestamp":"2026-08-21T13:20:53.058686+00:00"}`.
+- `GET https://audinexa.com/` → **HTTP 200**, `<title>AUDINEXA — Audiology Clinic OS</title>`.
+- **Auth gates verified** — every protected route probed returns HTTP 401 without credentials:
+  - `GET /api/advance-receipts` → 401
+  - `GET /api/billing/invoices` → 401
+  - `GET /api/billing/payments` → 401
+  - `GET /api/ha/sales` → 401
+  - `GET /api/referral-partners` → 401
+  - `GET /api/referral-partners/RP-BOGUS/payouts` → 401
+  - `GET /api/advance-receipts/AR-BOGUS` → 401
+  - `GET /api/advance-receipts/AR-BOGUS/receipt.pdf` → 401
+- **New Phase 2B.2 route live and auth-gated**: `POST /api/advance-receipts/AR-DOESNOTEXIST-BOGUS/allocations` (empty body, synthetic receipt id, probe Idempotency-Key) → **HTTP 401**. Request never reached business logic.
+- **404 sanity control**: `GET /api/definitely-nonexistent-route` → 404 — confirms the 401 responses are authentication gates, not missing routes.
+- **Zero unexpected Production 5xx** across all probed surfaces (no 500 / 502 / 503 / 504 observed).
+- **Build / commit identity**: `/api/version`, `/api/commit`, `/api/health/build`, `/api/health/version`, `/api/build` all return 404 — no public build-info endpoint exists in this application. Same posture as NAV-012 and Phase 2A closures.
+
+**Production data-safety (this closure + the entire Phase 2B.2 verification cycle)**:
+
+- **Authenticated Production requests = 0.**
+- **Production writes = 0.**
+- **Advance Allocations created in Production during verification = 0.**
+- **Advance Payments created in Production during verification = 0.**
+- **Advance Receipts created in Production during verification = 0.**
+- **Invoice modifications = 0.**
+- **Payment modifications = 0.**
+- **Refunds = 0.**
+- **Voids = 0.**
+- **Inventory modifications = 0.**
+- **Serial modifications = 0.**
+- **Migrations = 0.**
+- **Backfill = 0.**
+- **Reconciliation = 0.**
+
+**Historical data safety**:
+
+- **127 legacy Advance Receipts remain untouched.** `available_balance` and `allocated_total` fields remain ABSENT on every legacy Phase 2A document.
+- **Historical backfill was NOT executed.**
+- **`AR-6A832F03B188`** (the one Preview-only null-balance transition row) remains untouched — status `active`, `available_balance: None`, `allocated_total: None`, byte-identical to its state prior to this sprint.
+- **No historical financial reconciliation was performed.**
+- **`tenant-sound-clinic-blr`, `INV/2026/000004`, and any historical Advance Receipt / payment / invoice were NOT queried or modified in Production.**
+- **Historical Production data was NOT directly inspected during this verification.**
+- **Production MongoDB state remains independently unverifiable from the available environment.**
+
+**Verification limitations (must NOT be represented as implementation failures)**:
+
+1. Production MongoDB data-plane state was not independently inspected — no approved read-only observation mechanism to Production DB from this container.
+2. Production build / commit identity is not exposed via any public probe (no `/api/version`, `/api/commit`, `/api/health/build`, `/api/health/version`, `/api/build`).
+
+**Deferred / NOT implemented (require separate explicit authorization)**:
+
+1. Advance Allocation reversal.
+2. Advance Allocation refund / reversal accounting.
+3. Allocation UI.
+4. Patient-profile allocation UI.
+5. Allocation reporting / dashboard enhancements.
+6. Historical Advance Receipt backfill (initialising `available_balance` / `allocated_total` on the 127 legacy documents).
+7. Historical Advance Receipt cleanup.
+8. Any automatic reconciliation.
+9. Cross-branch allocation enhancement (current policy: cross-branch within the same clinic is permitted by default).
+10. Any additional financial idempotency work beyond the current approved implementation.
+11. Any future Phase 2B.3 work.
+
+**Explicit statement**: No next phase has been started. Phase 2B.3 has not been started. Allocation reversal has not been started. Advance refund has not been started. Allocation UI has not been started. Historical backfill has not been started. Historical cleanup has not been started. Any reconciliation has not been started. NAV-012 further work has not been started. NAV-013 has not been started. No unrelated financial hardening or technical debt work has been started.
+
+---
+
+
 ## 🏁 URGENT CLIENT REQUIREMENT · ADVANCE RECEIPT · PHASE 2A — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview implementation, Preview regression (28/28 targeted + NAV-005..NAV-012 clean-runs), user's manual Production deployment, and read-only Production post-deployment verification.
