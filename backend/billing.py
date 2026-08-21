@@ -1234,6 +1234,22 @@ async def refund_invoice(invoice_id: str, payload: RefundCreate,
     if user.get("role") not in {"clinic_owner", "accounts", "front_desk", "super_admin", "founder"}:
         raise HTTPException(status_code=403, detail="You don't have permission to issue refunds")
 
+    # NAV-011 · Phase 2B.1 · Safety correction — reserve method="advance"
+    # exclusively for the (future) Advance Allocation / Allocation-Void
+    # workflow. A manual refund from this endpoint MUST NOT be able to
+    # smuggle in `method="advance"`, otherwise clinic staff could emit
+    # refund rows that spoof allocation reversals. Fail fast (before the
+    # idempotency key is consumed) so retries with a corrected method
+    # succeed cleanly.
+    if payload.method == "advance":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "method='advance' is reserved for the Advance Allocation "
+                "workflow and cannot be used for a manual refund."
+            ),
+        )
+
     idem = await IdempotencyContext.enter(
         request, db,
         scope="refund", clinic_id=user["clinic_id"],
