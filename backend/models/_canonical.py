@@ -336,7 +336,15 @@ class ReminderLog(BaseModel):
 
 # ==================== UC-04 BILLING + REPORT HANDOVER ====================
 
-PAYMENT_METHODS = ["cash", "upi", "card", "bank_transfer", "insurance"]
+# NAV-011 · Phase 2B.1 · `"advance"` added as a *persisted* payment method
+# used exclusively by the (future) Phase 2B.2 allocation writer when a
+# patient's Advance Receipt is applied against an invoice. It is NOT a
+# valid choice on the front-desk `PaymentCreate` payload — that Literal
+# below deliberately excludes it so only the allocation route can produce
+# a payment row with `method="advance"`. `RefundCreate.method` however
+# DOES accept it, because the compensating refund emitted by an
+# allocation-void must carry the same method as the original allocation.
+PAYMENT_METHODS = ["cash", "upi", "card", "bank_transfer", "insurance", "advance"]
 INVOICE_STATUSES = ["draft", "paid", "partial", "refunded", "cancelled"]
 
 
@@ -429,7 +437,11 @@ class Payment(BaseModel):
     # by the default. Do NOT change the default: it preserves the
     # historic invariant that `sum(payments.amount) == paid_total`.
     kind: Literal["payment", "refund"] = "payment"
-    method: Optional[Literal["cash", "upi", "card", "bank_transfer", "insurance"]] = None
+    # NAV-011 · Phase 2B.1 · `"advance"` added to the *persisted* method
+    # enum so the (future) allocation writer can stamp payments sourced
+    # from an Advance Receipt. `PaymentCreate.method` (below) does NOT
+    # accept `"advance"` — only the allocation route can produce it.
+    method: Optional[Literal["cash", "upi", "card", "bank_transfer", "insurance", "advance"]] = None
     amount: float
     reference: Optional[str] = None                              # Txn ref / UPI UTR / card last-4
     # Free-text refund reason — required when kind=="refund", ignored otherwise.
@@ -437,9 +449,21 @@ class Payment(BaseModel):
     paid_at: Optional[Union[str, datetime]] = Field(default_factory=datetime.utcnow)
     received_by_user_id: Optional[str] = None
     notes: Optional[str] = None
+    # NAV-011 · Phase 2B.1 · Nullable back-links to the source Advance
+    # Receipt + Allocation ledger row. Populated ONLY when
+    # `method == "advance"` (i.e. by the Phase 2B.2 allocation writer
+    # and its compensating void-refund). All existing payment rows in
+    # the DB will continue to omit both fields; Pydantic defaults them
+    # to None on read-back.
+    advance_receipt_id: Optional[str] = None
+    allocation_id: Optional[str] = None
 
 
 class PaymentCreate(BaseModel):
+    # NAV-011 · Phase 2B.1 · `"advance"` DELIBERATELY excluded here —
+    # front-desk / accounts staff cannot log a manual "advance-method"
+    # payment. The Phase 2B.2 allocation route is the only writer
+    # permitted to emit a `Payment.method == "advance"` row.
     method: Literal["cash", "upi", "card", "bank_transfer", "insurance"]
     amount: float
     reference: Optional[str] = None
@@ -452,9 +476,15 @@ class RefundCreate(BaseModel):
     handled by the clinic offline (cash back, manual UPI reversal, bank
     transfer). The row lands in the same `payments` collection with
     `kind="refund"` for audit-trail purposes.
+
+    NAV-011 · Phase 2B.1 · `"advance"` accepted here so the (future)
+    allocation-void writer can emit its compensating refund with the
+    same method label as the original allocation. Clinic staff issuing
+    a MANUAL refund via this endpoint should NOT choose `"advance"` —
+    the router will reject it in Phase 2B.2 via an explicit guard.
     """
     amount: float = Field(gt=0, description="Positive ₹ amount to refund")
-    method: Literal["cash", "upi", "card", "bank_transfer", "insurance"]
+    method: Literal["cash", "upi", "card", "bank_transfer", "insurance", "advance"]
     reason: str = Field(min_length=3, max_length=500)
     reference: Optional[str] = Field(default=None, max_length=120)
     notes: Optional[str] = Field(default=None, max_length=500)

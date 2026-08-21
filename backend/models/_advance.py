@@ -18,9 +18,30 @@ Phase 2A endpoints (this file):
   * `GET  /api/advance-receipts/{id}/receipt.pdf` — printable acknowledgement
 
 Phase 2B/2C/2D (NOT in this file — DO NOT implement here):
-  * allocation to a future invoice
+  * allocation to a future invoice          ← engine deferred to Phase 2B.2+
   * refund of an advance back to the customer
   * merge/interaction with existing invoices/payments
+
+Phase 2B.1 (this commit — DATA MODEL PREPARATION ONLY):
+  * Nullable `available_balance` / `allocated_total` fields on
+    `AdvanceReceipt` — populated by Phase 2B.2's allocation writer
+    and by Phase 2B's controlled backfill. Left `None` for now on
+    every historical row; the Phase 2A router MUST continue to ignore
+    them (no runtime behaviour change).
+  * `AdvanceAllocation` / `AdvanceAllocationCreate` /
+    `AdvanceAllocationVoidIn` schema classes for the future
+    `db.advance_allocations` ledger collection. NO router uses them
+    yet.
+
+Proposed indexes (Phase 2B.2+ — NOT created here):
+  * `advance_allocations`:
+      - unique  (clinic_id, allocation_id)
+      - unique  (clinic_id, allocation_no)
+      -         (clinic_id, advance_receipt_id, status)
+      -         (clinic_id, invoice_id)
+  * `payments` (additive, partial):
+      -         (clinic_id, advance_receipt_id) — partial where field exists
+      -         (clinic_id, allocation_id)      — partial where field exists
 """
 from __future__ import annotations
 
@@ -120,6 +141,23 @@ class AdvanceReceipt(BaseModel):
 
     status: AdvanceReceiptStatus = "active"
 
+    # ── Phase 2B.1 · Balance ledger fields (Optional, default None) ──
+    # `available_balance` and `allocated_total` are added as the schema
+    # anchor for Phase 2B.2's allocation writer. They are DELIBERATELY
+    # nullable with default `None` so that:
+    #   1. No backfill runs in Phase 2B.1 — every existing DB row keeps
+    #      its exact current shape until Phase 2B.2 initialises them.
+    #   2. The Phase 2A router does not read or emit them, preserving
+    #      100 % of the currently-deployed API contract.
+    #   3. Phase 2B.2 can choose eager (init on create + backfill) OR
+    #      lazy (init on first allocation) semantics without breaking
+    #      this model.
+    # Invariant target (enforced only in Phase 2B.2+):
+    #     available_balance = received_amount − allocated_total
+    #     available_balance ≥ 0
+    available_balance: Optional[float] = None
+    allocated_total: Optional[float] = None
+
     received_at: str = Field(default_factory=_now_iso)
     created_at: str = Field(default_factory=_now_iso)
     created_by_user_id: Optional[str] = None
@@ -147,6 +185,112 @@ class AdvanceAuditEvent(BaseModel):
     payload: Optional[dict] = None
 
 
+# ═══════════════════════════════════════════════════════════════════════
+# PHASE 2B.1 · Advance Allocation Ledger — SCHEMA ONLY
+# ═══════════════════════════════════════════════════════════════════════
+# These classes describe the future `db.advance_allocations` collection
+# that will land in Phase 2B.2. **No router uses them yet.** They are
+# defined here so:
+#   * downstream code can `from models._advance import AdvanceAllocation`
+#     without pulling schema changes across another commit,
+#   * pytest can validate the shape ahead of the allocation writer's
+#     first real usage,
+#   * anybody reading the codebase understands the target data model
+#     ahead of the implementation sprint.
+#
+# See `/app/memory/ADVANCE_ALLOCATION_PHASE1_AUDIT.md` §4 & §5 for the
+# state-machine + concurrency rationale.
+
+AdvanceAllocationStatus = Literal["active", "voided"]
+
+
+class AdvanceAllocationCreate(BaseModel):
+    """POST body for the (future) Phase 2B.2 allocation endpoint.
+
+    * `amount` MUST be > 0 (rupees, 2-decimal precision).
+    * `invoice_id` MUST belong to the same clinic AND the same patient
+      as the source Advance Receipt (enforced by the router, not here).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    invoice_id: str = Field(..., min_length=1, max_length=64)
+    amount: float = Field(..., gt=0)
+    note: Optional[str] = Field(default=None, max_length=500)
+
+    @field_validator("amount")
+    @classmethod
+    def _amount_positive(cls, v: float) -> float:
+        if v != v:  # NaN check
+            raise ValueError("amount must be a real number > 0")
+        return round(float(v), 2)
+
+
+class AdvanceAllocationVoidIn(BaseModel):
+    """POST body for the (future) Phase 2B.2 void-allocation endpoint."""
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str = Field(..., min_length=3, max_length=500)
+
+
+class AdvanceAllocation(BaseModel):
+    """Persisted allocation row (`db.advance_allocations`) — the source
+    of truth for how an Advance Receipt has been consumed against real
+    invoices.
+
+    Money-story invariants (enforced only by the Phase 2B.2 writer):
+      * `SUM(amount WHERE status='active')` per (clinic_id, advance_receipt_id)
+        equals the parent receipt's `allocated_total`.
+      * Every `active` row corresponds to exactly one `payments` row
+        with `method='advance'`, `allocation_id=<this.allocation_id>`,
+        `advance_receipt_id=<this.advance_receipt_id>`.
+      * Every `voided` row corresponds to exactly one offsetting refund
+        row on the same invoice (`kind='refund'`, negative `amount`,
+        matching `allocation_id`).
+    """
+    model_config = ConfigDict(extra="ignore")
+
+    allocation_id: str = Field(
+        default_factory=lambda: f"AA-{uuid4().hex[:12].upper()}"
+    )
+    # AA/YYYY/NNNNNN — clinic-scoped, year-reset counter. Assigned by the
+    # Phase 2B.2 writer via `db.counters` (mirrors AR/YYYY/NNNNNN).
+    allocation_no: str
+
+    clinic_id: str
+    branch_id: Optional[str] = None
+
+    advance_receipt_id: str
+    advance_receipt_no: Optional[str] = None
+
+    invoice_id: str
+    invoice_no: Optional[str] = None
+
+    patient_id: str
+    amount: float
+
+    status: AdvanceAllocationStatus = "active"
+
+    # Idempotency + FK to the payment row emitted by the allocation
+    # writer. Both are Optional here because they are stamped by the
+    # writer after CAS wins; the model itself must survive being read
+    # back before those fields have been persisted (defensive).
+    correlation_id: Optional[str] = None
+    idempotency_correlation_id: Optional[str] = None
+    payment_id: Optional[str] = None
+    note: Optional[str] = None
+
+    created_at: str = Field(default_factory=_now_iso)
+    created_by_user_id: Optional[str] = None
+    created_by_name: Optional[str] = None
+
+    voided_at: Optional[str] = None
+    void_reason: Optional[str] = None
+    voided_by_user_id: Optional[str] = None
+    voided_by_name: Optional[str] = None
+    # FK to the compensating refund row emitted on void.
+    void_refund_payment_id: Optional[str] = None
+
+
 __all__ = [
     "ADVANCE_PAYMENT_METHODS",
     "AdvanceReceiptStatus",
@@ -154,4 +298,9 @@ __all__ = [
     "AdvanceVoidIn",
     "AdvanceReceipt",
     "AdvanceAuditEvent",
+    # Phase 2B.1 · additive schema (no router usage yet)
+    "AdvanceAllocationStatus",
+    "AdvanceAllocationCreate",
+    "AdvanceAllocationVoidIn",
+    "AdvanceAllocation",
 ]

@@ -66,7 +66,18 @@ STALE_THRESHOLD_SECONDS = 90
 # TTL for the idempotency record itself (from create_at) — 24 hours.
 TTL_SECONDS = 24 * 3600
 
-SUPPORTED_SCOPES = ("payment", "refund", "payout", "advance_receipt")
+SUPPORTED_SCOPES = (
+    "payment",
+    "refund",
+    "payout",
+    "advance_receipt",
+    # NAV-011 · Phase 2B.1 · Scope reserved for the (future) Phase 2B.2
+    # allocation writer. Adding it here is a pure schema/registration
+    # change — no router uses this scope yet, so `IdempotencyContext.
+    # enter(scope="advance_allocation", ...)` cannot be triggered by
+    # any live endpoint until Phase 2B.2 lands.
+    "advance_allocation",
+)
 
 
 def _now_utc() -> datetime:
