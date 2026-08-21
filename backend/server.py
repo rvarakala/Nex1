@@ -1096,6 +1096,67 @@ async def health_check():
     return {"status": "healthy", "timestamp": datetime.now(timezone.utc).isoformat()}
 
 
+# ==================== NAV-012 Phase 2B · Bundle D · Build Identity ====================
+# Additive-only sibling of /api/health. Read-only, database-free,
+# tenant-independent, unauthenticated. Exposes the deployed build/commit
+# identity so post-deployment verification can independently confirm which
+# build is actually running on Production.
+#
+# Source precedence (each field independent, computed ONCE at import time so
+# every request is a dict-return with no subprocess cost):
+#   commit      ← BUILD_COMMIT_SHA  → git rev-parse --short HEAD  → "unknown"
+#   built_at    ← BUILD_BUILT_AT    → git log -1 --format=%aI     → "unknown"
+#   environment ← APP_ENV                                          → "unknown"
+#   version     ← APP_VERSION (only included when the env var is set;
+#                  deliberately NOT hard-coded to a sprint identifier)
+#
+# No auth. No DB. No tenant scope. No financial data. No frontend touch.
+def _compute_build_identity() -> dict:
+    import subprocess
+    import os as _os
+
+    def _run_git(args: list) -> str:
+        try:
+            r = subprocess.run(
+                ["git", *args],
+                cwd="/app",
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            return r.stdout.strip() if r.returncode == 0 else ""
+        except Exception:
+            return ""
+
+    commit = (_os.environ.get("BUILD_COMMIT_SHA") or "").strip()
+    if not commit:
+        commit = _run_git(["rev-parse", "--short", "HEAD"])
+
+    built_at = (_os.environ.get("BUILD_BUILT_AT") or "").strip()
+    if not built_at:
+        built_at = _run_git(["log", "-1", "--format=%aI"])
+
+    identity = {
+        "commit": commit or "unknown",
+        "built_at": built_at or "unknown",
+        "environment": (_os.environ.get("APP_ENV") or "").strip() or "unknown",
+    }
+    # `version` is INCLUDED ONLY when APP_VERSION is explicitly provided.
+    # Do NOT hard-code a sprint marker — that would misrepresent build identity.
+    _version = (_os.environ.get("APP_VERSION") or "").strip()
+    if _version:
+        identity["version"] = _version
+    return identity
+
+
+_BUILD_IDENTITY = _compute_build_identity()
+
+
+@api_router.get("/health/build")
+async def health_build():
+    return _BUILD_IDENTITY
+
+
 # Non-prefixed /health for Kubernetes liveness/readiness probes.
 # Emergent's K8s probe hits 127.0.0.1:8001/health (no /api prefix) and a 404
 # would mark the pod unhealthy and fail the deployment.
