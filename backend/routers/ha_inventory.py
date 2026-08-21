@@ -16,7 +16,6 @@ from pymongo import ReturnDocument
 
 from auth import (
     get_current_user, require_roles, user_can_see_branch,
-    CLINIC_WIDE_ROLES,
 )
 from database import get_db
 from models_ha import (
@@ -25,20 +24,14 @@ from models_ha import (
 )
 
 log = logging.getLogger(__name__)
+# NAV-010 · INV-014 — shared branch-scope helper. Alias-imported as
+# ``_branch_scope`` so every existing call site inside this module keeps
+# resolving without any rename.
+from utils.branch_scope import branch_scope as _branch_scope  # noqa: F401
 from utils.ha_states import transition_serial
 from utils.serde import serialize_datetime, deserialize_datetime, safe_deserialize_rows
 
 router = APIRouter(prefix="/api/ha")
-
-
-def _branch_scope(user: dict) -> dict:
-    """Return a Mongo filter fragment that restricts to branches this user can see."""
-    if user["role"] in CLINIC_WIDE_ROLES:
-        return {"clinic_id": user["clinic_id"]}
-    return {
-        "clinic_id": user["clinic_id"],
-        "branch_id": {"$in": user.get("branch_ids") or []},
-    }
 
 
 # ==================== SERIAL ITEMS ====================
@@ -581,6 +574,8 @@ async def mark_serial_demo(
     )
     await db.serial_events.insert_one({
         "serial_id": serial_id,
+        # NAV-010 · INV-009 · Forward-only tenant stamping.
+        "clinic_id": user["clinic_id"],
         "from": row["state"], "to": row["state"],  # pool-only change
         "at": now, "actor_user_id": user["user_id"],
         "ref_doc": {"kind": "pool-change", "to_pool": "demo"},
@@ -620,6 +615,8 @@ async def unmark_serial_demo(
     note = (payload or {}).get("note") if payload else None
     await db.serial_events.insert_one({
         "serial_id": serial_id,
+        # NAV-010 · INV-009 · Forward-only tenant stamping.
+        "clinic_id": user["clinic_id"],
         "from": row["state"], "to": row["state"],
         "at": now, "actor_user_id": user["user_id"],
         "ref_doc": {"kind": "pool-change", "to_pool": "saleable"},
@@ -767,6 +764,8 @@ async def return_borrowed_unit(
     )
     await db.serial_events.insert_one({
         "serial_id": serial_id,
+        # NAV-010 · INV-009 · Forward-only tenant stamping.
+        "clinic_id": user["clinic_id"],
         "from": row["state"], "to": "RETURNED",
         "at": now, "actor_user_id": user["user_id"],
         "ref_doc": {"kind": "return-to-source",

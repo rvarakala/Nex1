@@ -98,6 +98,10 @@ async def transition_serial(
 
     await db.serial_events.insert_one({
         "serial_id": serial_id,
+        # NAV-010 · INV-009 · Forward-only tenant stamping.
+        # Historical rows are NOT backfilled — new events only. Read from
+        # the SerialItem doc so we cannot drift from the source of truth.
+        "clinic_id": si.get("clinic_id"),
         "from": from_state,
         "to": to_state,
         "at": now,

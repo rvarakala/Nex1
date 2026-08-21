@@ -20,24 +20,18 @@ from pymongo.errors import BulkWriteError, DuplicateKeyError
 
 from auth import (
     get_current_user, require_roles, user_can_see_branch,
-    CLINIC_WIDE_ROLES,
 )
 from database import get_db
 from models_ha import (
     PurchaseOrder, PurchaseOrderCreate, POLine,
     GRN, GRNCreate, GRNLine,
 )
+from utils.branch_scope import branch_scope as _branch_scope  # noqa: F401
 from utils.numbering import next_number
 from utils.po_states import assert_po_transition, PO_RECEIVABLE, auto_advance_on_grn
 from utils.serde import serialize_datetime, deserialize_datetime
 
 router = APIRouter(prefix="/api/ha")
-
-
-def _branch_scope(user: dict) -> dict:
-    if user["role"] in CLINIC_WIDE_ROLES:
-        return {"clinic_id": user["clinic_id"]}
-    return {"clinic_id": user["clinic_id"], "branch_id": {"$in": user.get("branch_ids") or []}}
 
 
 def _compute_po_totals(lines: List[POLine]) -> tuple[float, float, float]:
@@ -328,6 +322,8 @@ async def create_grn(
                 })
                 serial_event_docs.append({
                     "serial_id": serial_id,
+                    # NAV-010 · INV-009 · Forward-only tenant stamping.
+                    "clinic_id": user["clinic_id"],
                     "from": "(new)",
                     "to": "IN_STOCK",
                     "at": now_iso,

@@ -150,7 +150,122 @@ async def lifespan(_app: FastAPI):
             [("clinic_id", 1), ("serial_no", 1)], unique=True, name="uniq_clinic_serial_no",
         )
         await db.serial_items.create_index([("clinic_id", 1), ("branch_id", 1), ("state", 1)])
+        # NAV-010 · Phase 2B · INV-018 · Performance index for the Inventory
+        # Board's serial listings which filter on
+        # (clinic, branch, product, state). Additive only — the existing
+        # (clinic, branch, state) covering scan is preserved. Wrapped in
+        # try/except to soft-fail if the index name already exists on a
+        # partially-migrated Preview.
+        try:
+            await db.serial_items.create_index(
+                [("clinic_id", 1), ("branch_id", 1), ("product_id", 1), ("state", 1)],
+                name="serial_clinic_branch_product_state",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-018 · serial_items index skipped: %s", _idx_err,
+            )
         await db.serial_events.create_index([("serial_id", 1), ("at", -1)])
+        # NAV-010 · Phase 2B · INV-010 · Clinic-scoped audit index. Only
+        # forward-only writes carry `clinic_id` (see INV-009 in
+        # utils/ha_states.py + ha_inventory.py + ha_procurement.py);
+        # historical rows have the field missing. The compound index
+        # still speeds up the "list events for this tenant" query path
+        # without penalising legacy rows. Wrapped in try/except.
+        try:
+            await db.serial_events.create_index(
+                [("clinic_id", 1), ("serial_id", 1), ("at", -1)],
+                name="serial_events_clinic_serial_at",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-010 · serial_events index skipped: %s", _idx_err,
+            )
+        # NAV-010 · Phase 2B · INV-011 · Compound index on accessory_events.
+        # Ledger currently has no index at all — every audit-rewind is a
+        # full-collection scan. `clinic_id` is already stamped by every
+        # existing writer (utils/accessory_stock.py::reserve/restore and
+        # ha_inventory.py::adjust_accessory_stock), so the compound is
+        # complete on new-and-legacy rows alike. Additive only.
+        try:
+            await db.accessory_events.create_index(
+                [("clinic_id", 1), ("sku_id", 1), ("at", -1)],
+                name="accessory_events_clinic_sku_at",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-011 · accessory_events index skipped: %s", _idx_err,
+            )
+        # NAV-010 · Phase 2B · INV-012 · Indexes on stock_requests. The
+        # collection has zero indexes today — list queries in
+        # routers/stock_requests.py:list_requests are full scans, and
+        # request_id uniqueness relies solely on UUID entropy. Additive
+        # only. Uniqueness on request_id is safe: every existing row was
+        # minted via `uuid4()` so collisions are astronomically unlikely.
+        try:
+            await db.stock_requests.create_index(
+                "request_id", unique=True, name="uniq_stock_request_id",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-012 · stock_requests unique index skipped: %s",
+                _idx_err,
+            )
+        try:
+            await db.stock_requests.create_index(
+                [("clinic_id", 1), ("status", 1), ("created_at", -1)],
+                name="stock_requests_clinic_status_ct",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-012 · stock_requests compound index skipped: %s",
+                _idx_err,
+            )
+        try:
+            await db.stock_requests.create_index(
+                [("group_id", 1), ("status", 1), ("created_at", -1)],
+                name="stock_requests_group_status_ct",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-012 · stock_requests group index skipped: %s",
+                _idx_err,
+            )
+        # NAV-010 · Phase 2B · INV-013 · Indexes on payment_reversals. The
+        # collection is created on first write in
+        # routers/ha_quick_sale.py:cancel_quick_sale (INV-005). No indexes
+        # exist today, so audit lookups (reversals-by-invoice /
+        # reversals-by-quick-sale) are scans. Additive only — payment /
+        # reversal logic is NOT modified in this sprint.
+        try:
+            await db.payment_reversals.create_index(
+                "reversal_id", unique=True, name="uniq_payment_reversal_id",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-013 · payment_reversals unique index skipped: %s",
+                _idx_err,
+            )
+        try:
+            await db.payment_reversals.create_index(
+                [("clinic_id", 1), ("invoice_id", 1)],
+                name="payment_reversals_clinic_invoice",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-013 · payment_reversals invoice index skipped: %s",
+                _idx_err,
+            )
+        try:
+            await db.payment_reversals.create_index(
+                [("clinic_id", 1), ("quick_sale_id", 1)],
+                name="payment_reversals_clinic_quick_sale",
+            )
+        except Exception as _idx_err:
+            _log.warning(
+                "NAV-010 · INV-013 · payment_reversals quick_sale index skipped: %s",
+                _idx_err,
+            )
         await db.purchase_orders.create_index([("clinic_id", 1), ("status", 1), ("created_at", -1)])
         # Numbering identifiers minted via `utils.numbering.next_number` are
         # CLINIC-SCOPED (counter is keyed by `(kind, clinic_id, year)`), so the
