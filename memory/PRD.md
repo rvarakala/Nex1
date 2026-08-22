@@ -1,6 +1,111 @@
 # ACS Audiology Clinic — Product Requirements Document
 
 
+## 🏁 SETTINGS → INTEGRATIONS HUB — FORMALLY CLOSED (2026-08-22)
+
+**Status**: 🟢 CLOSED · signed off by user after Preview implementation, targeted Preview regression (15/15 new + 6/6 adjacent WhatsApp Settings regression), user's manual Production deployment, and strictly read-only unauthenticated Production post-deployment verification at 🟢 PASS.
+
+**Title**: Settings → Integrations Hub — unified read-only view of AUDINEXA's supported third-party integrations.
+
+**Scope Delivered**:
+
+A new `Settings → Integrations` page that consolidates the configuration state of the **four already-supported third-party integrations** into a single provider-card view. Purely additive; no new integration infrastructure introduced; no financial / NAV / Advance architecture touched.
+
+**Supported providers (exactly the four AUDINEXA actually ships today)**:
+
+| Provider | Category | Configuration source | Managed by |
+|---|---|---|---|
+| Razorpay | Payments | Env vars `RAZORPAY_KEY_ID / KEY_SECRET / WEBHOOK_SECRET` | Platform |
+| MSG91 (WhatsApp) | Messaging | Per-clinic `whatsapp_configs` collection (BYOG or hosted) + env fallback `MSG91_AUTH_KEY / MSG91_API_KEY` | Clinic (via `/settings/connect`) |
+| ZeptoMail | Email (SMTP) | Env vars `ZEPTO_SMTP_HOST / SMTP_PASSWORD / FROM_ADDRESS` | Platform |
+| Twilio | SMS | Env vars `TWILIO_ACCOUNT_SID / AUTH_TOKEN / FROM_NUMBER` | Platform |
+
+**Backend Endpoint (new · read-only · additive)**:
+
+```
+GET /api/settings/integrations   (auth-gated · reuses get_current_user)
+```
+
+Reuses the existing env-var + `whatsapp_configs` presence-check pattern already established in `routers/status_page.py::_probe_*`. Never returns raw secret values (enforced by `test_no_raw_secrets_in_response` + `test_response_does_not_include_any_password_or_token_field_name`). No outbound HTTP calls. One `find_one` on `whatsapp_configs` per invocation. No writes anywhere.
+
+**Response shape**: `{ integrations: [{ provider_id, name, category, purpose, status, detail, managed_by, config_surface, action_href, action_label }], as_of }`. Four status vocabulary values: `operational | degraded | outage | unknown | not_available`.
+
+**Frontend (new tab)**:
+- `Settings → Integrations` (`Puzzle` icon, admin-only) rendering a responsive provider-card grid with status pills, category badges, one-line purpose copy, detail chips, managed-by tags, and a deep-link `Configure` button (WhatsApp only → `/settings/connect`; platform-managed providers show text-only *"Managed by your deployment"*). Non-owner users see the `Configure` button disabled.
+- Full `data-testid` coverage (`integrations-tab`, `integrations-heading`, `integrations-refresh`, `integrations-grid`, `integration-card-{provider_id}`, `integration-status-{provider_id}`, `integration-action-{provider_id}`, `settings-nav-integrations`, etc.).
+
+**Deployment Surface (exactly 4 files)**:
+
+- `backend/routers/settings.py` — +169 lines, single endpoint appended at end of file; every existing endpoint byte-identical
+- `frontend/src/modules/settings/SettingsIntegrationsTab.jsx` *(new · 264 lines)*
+- `frontend/src/modules/settings/SettingsModule.js` — +5 / −1, nav entry + Route + import (`Puzzle` icon)
+- `backend/tests/test_settings_integrations_hub.py` *(new · 272 lines · 15 targeted tests)*
+
+**Preview Test Evidence**:
+- **New targeted suite** (`backend/tests/test_settings_integrations_hub.py`): **15 / 15 PASS** in 4.05 s — auth gate, response shape, all 4 providers present exactly once, required-fields coverage, status vocabulary, category taxonomy, zero raw-secret leakage, zero secret-shaped field names, WhatsApp card BYOG/degraded/disabled reflection, platform-managed providers have no action_href, clinic-managed WhatsApp deep-links to `/settings/connect`, two-GET idempotency, no `whatsapp_configs` mutation.
+- **Adjacent WhatsApp Settings regression** (`backend/tests/test_connect_whatsapp.py`): **6 / 6 PASS** in 4.03 s — deterministic, first attempt.
+
+**Manual Production Deployment**:
+- Manual Production deployment was performed by the user.
+- **Emergent did NOT deploy automatically.**
+- Post-deployment verification was strictly read-only unauthenticated.
+
+**Production Post-Deployment Verification (2026-08-22 · unauthenticated read-only · `https://audinexa.com`)**:
+
+| Check | Result |
+|---|---|
+| `GET /api/health` | `200 · {"status":"healthy","timestamp":"2026-08-22T04:25:04.202899+00:00"}` in 0.28 s |
+| `GET /` | `200 · <title>AUDINEXA — Audiology Clinic OS</title>` in 0.46 s |
+| `GET /api/settings/integrations` (unauth) | **`401 · {"detail":"Not authenticated"}`** in 0.19 s — new endpoint mounted and auth-gated |
+| `GET /api/settings/clinic` (unauth) | `401` — existing Settings surface intact |
+| `GET /api/connect/whatsapp` (unauth) | `401` — existing WhatsApp Settings surface intact |
+| `GET /api/settings/hours`, `/api/settings/services` | `404` — pre-existing pattern (these tabs use `/api/branches`, `/api/clinic-hours`, `/api/billing/services`); **NOT** a regression |
+| NAV-010 · `GET /api/ha/serial-items/DUMMY/timeline`, `/api/ha/products` | `401` × 2 |
+| NAV-011 · `GET /api/referral-partners`, `/api/referral-partners/DUMMY/stats` | `401` × 2 |
+| NAV-012 · `GET /api/advance-receipts`, `/api/advance-receipts/DUMMY/allocations` | `401` × 2 |
+| Synthetic 404 · `GET /api/definitely-not-a-real-route-integrations-verify-xyz` | `404 · {"detail":"Not Found"}` |
+| Unexpected 5xx count | **0** |
+| Secret-safety scan on response body | **NONE** of `rzp_*`, `AC[a-f0-9]{32}`, `SK[a-f0-9]{32}`, `RAZORPAY_KEY_SECRET`, `TWILIO_AUTH_TOKEN`, `ZEPTO_SMTP_PASSWORD`, `MSG91_AUTH_KEY`, `auth_key_encrypted`, `webhook_secret`, `"secret"`, `"password"`, `"api_key"` present |
+| Authenticated Production requests | **0** |
+| Production writes (POST/PUT/PATCH/DELETE) | **0** |
+| Production DB modifications | **0** |
+| Migrations / backfill / reconciliation / cleanup | **NONE** |
+
+**Known observation (inherited, non-blocking)**: `GET /api/health/build` continues to return `{"commit":"unknown","built_at":"unknown","environment":"unknown"}` — the pre-existing NAV-012 Bundle D Option-C deferral. Sprint commit identity remains not-independently-verifiable from Production. **Not a Settings → Integrations Hub regression** and, per user directive, **NOT** in scope of this verification.
+
+**Closed architecture untouched (verified via `git diff --name-only`)**:
+- NAV-009 · Payments / Refunds — UNCHANGED
+- NAV-010 · Inventory hardening — UNCHANGED
+- NAV-011 · Referral attribution / payout writers — UNCHANGED
+- NAV-012 · Advance Receipts / Allocation / Apply Advance UX / Bundle D handler — UNCHANGED
+- `billing.py` financial atomic paths — UNCHANGED
+- Every existing Settings tab (`ClinicDetailsTab`, `StaffSettingsTab`, `ConnectWhatsAppTab`, `SecurityPrivacyTab`, `BranchesTab`, `ClinicGroupTab`, `DataImportTab`, `PrintTemplatesTab`, `ServiceCatalogPage`, `MyProfileTab`, `MySignatureTab`, `MySealTab`) — UNCHANGED
+- MongoDB indexes — UNCHANGED (no new indexes created for this hub)
+- Historical data — UNCHANGED (no rows modified anywhere)
+
+**Deferred items remain deferred (NOT started, still explicitly HOLD)**:
+- **Settings → Billing Preferences** — future work item
+- **Scheduled Reports** (Reports & Analytics fourth sub-item) — future work item
+- **Revenue Dashboard changes** — future work item
+- **NAV-010 · INV-015** (stock-transfer tenant-boundary audit row) — HOLD
+- **NAV-010 · INV-016** (unique `ha_products` index implementation) — HOLD
+- **NAV-010 · INV-017** (`sync_inventory` history-array → `serial_events` migration) — HOLD
+- **NAV-011 Phase 2B** (auto-recovery emission) — HOLD
+- **NAV-011 Phase 2D** (historical duplicate `partner_payouts` reconciliation) — BLOCKED on business decision
+- **NAV-012 Phase 2C** (refund of unallocated advance) — NOT STARTED
+- **NAV-012 Bundle D env-vars** (build identity Option-C deferral) — DEFERRED
+- **Advance Allocation Phase 2B.4** — NOT STARTED
+- **NAV-013** — scope undefined
+- **NAV-008 counter reconciliation** (`INV/2026/000004` on `tenant-sound-clinic-blr`) — BLOCKED on business decision
+- **`backend/server.py:614-619` startup counter cleanup hardening** — NOT STARTED
+- **REC-AUTO-001** — PERMANENTLY DEFERRED by product decision. Do NOT reopen.
+
+**No further Settings → Integrations Hub work planned.** Every deferred item requires explicit future authorization from the user before implementation may commence.
+
+---
+
+
+
 ## 🏁 NAV-011 · PHASE 2C — CATEGORY-AWARE EXTERNAL-PARTNER REVENUE ATTRIBUTION — FORMALLY CLOSED (2026-08-21)
 
 **Status**: 🟢 CLOSED · signed off by user after Preview implementation, targeted Preview regression (17/17 new Phase 2C tests + 42/42 NAV-011 Phase 2A regression tests), UX-terminology correction, user's manual Production deployment, and strictly read-only unauthenticated Production probes at 🟢 PASS. Deployment agent surfaced one pre-existing static-analysis flag on `backend/server.py:614-619` (destructive counter cleanup on startup) which is UNRELATED to Phase 2C's changeset and is queued as a separate future hardening item; live Production evidence contradicts any regression concern.
